@@ -1972,6 +1972,31 @@ def _cap_diff_unified(diff: str, max_bytes: int = _DIFF_UNIFIED_MAX_BYTES) -> st
     return f"{head}\n# … diff truncated ({omitted} more bytes)"
 
 
+def _result_sans_diff_echo(result: str) -> str:
+    """The file-edit result JSON minus its `diff` echo.
+
+    Used for verbose `result_text` when the FULL diff already ships as
+    `diff_unified`: a multi-KB diff echo inside the result JSON gets
+    tail-capped by `_cap_tui_verbose_text` into an unparseable JSON-looking
+    fragment that a client can neither render nor reliably suppress. The
+    native renderer shows the real diff, so result_text should carry only the
+    non-diff signal (success/files_modified/warnings/lsp_diagnostics).
+    Returns `result` unchanged when it isn't a JSON object with a `diff` key.
+    """
+    try:
+        data = json.loads(result)
+    except Exception:
+        return result
+    if not isinstance(data, dict) or "diff" not in data:
+        return result
+    try:
+        return json.dumps(
+            {k: v for k, v in data.items() if k != "diff"}, ensure_ascii=False
+        )
+    except Exception:
+        return result
+
+
 def _redact_tui_verbose_text(text: str) -> str:
     try:
         from agent.redact import redact_sensitive_text
@@ -2093,10 +2118,6 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
-    if _session_verbose(sid):
-        result_text = _tool_result_text(result)
-        if result_text:
-            payload["result_text"] = result_text
     if name == "todo":
         try:
             data = json.loads(result)
@@ -2134,6 +2155,15 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
             payload["diff_unified"] = _cap_diff_unified(diff_unified)
     except Exception:
         pass
+    if _session_verbose(sid):
+        # Computed AFTER diff_unified: when the full diff ships natively, the
+        # result_text drops the in-JSON diff echo (it would tail-cap into
+        # unparseable JSON-looking noise under the client's rendered diff).
+        result_text = _tool_result_text(
+            _result_sans_diff_echo(result) if payload.get("diff_unified") else result
+        )
+        if result_text:
+            payload["result_text"] = result_text
     if _tool_progress_enabled(sid) or payload.get("inline_diff") or payload.get("diff_unified"):
         _emit("tool.complete", sid, payload)
 

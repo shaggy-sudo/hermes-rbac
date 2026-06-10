@@ -15,6 +15,7 @@ import { createSessionStore, type ToolPartState } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { BashToolBody, commandOf } from '../view/tools/bashTool.tsx'
+import { diffOutputPlan, FileToolBody } from '../view/tools/fileTool.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
 type Store = ReturnType<typeof createSessionStore>
@@ -317,6 +318,103 @@ describe('file tool renderer — relative path + diff stats (Epic 2.3)', () => {
     const part = last?.parts?.find((p): p is ToolPartState => p.type === 'tool' && p.id === 'f3')
     expect(part?.diffUnified).toBe(DIFF)
     expect(part?.diffStats).toEqual({ added: 2, removed: 1 })
+  })
+})
+
+describe('file tool — output suppression under a rendered diff (no raw JSON, ever)', () => {
+  // A file-edit result is a JSON record whose payload IS the diff. In a verbose
+  // session the gateway REDACTS + CAPS result_text, so it can arrive truncated
+  // mid-JSON (unparseable) — that JSON-looking blob must never render below the
+  // native diff. Plain-text results (lint tails etc.) must still render.
+  const DIFF = ['--- a/x.py', '+++ b/x.py', '@@ -1,2 +1,2 @@', ' ctx', '-old', '+new'].join('\n')
+
+  const part = (resultText: string): ToolPartState => ({
+    type: 'tool',
+    id: 'fp1',
+    name: 'patch',
+    state: 'complete',
+    args: { path: '/p/x.py' },
+    resultText,
+    diffUnified: DIFF,
+    diffStats: { added: 1, removed: 1 }
+  })
+
+  test('diffOutputPlan: truncated/unparseable JSON is suppressed; plain text renders; JSON warnings surface', () => {
+    // gateway-capped mid-JSON (unparseable, still contains "diff") → suppress
+    const capped = '{"success": true, "diff": "--- a/x.py\\n+++ b/x.py\\n@@ -1,2 +1'
+    expect(diffOutputPlan(part(capped))).toEqual({ kind: 'suppress' })
+    // intact JSON echo of the diff → suppress
+    expect(diffOutputPlan(part(JSON.stringify({ success: true, diff: DIFF })))).toEqual({ kind: 'suppress' })
+    // plain text (lint tail) → full output block
+    expect(diffOutputPlan(part('warning: trailing whitespace on line 3'))).toEqual({ kind: 'output' })
+    // parseable JSON carrying real non-diff signal → just the notes
+    expect(diffOutputPlan(part(JSON.stringify({ success: true, diff: DIFF, warning: 'mode fallback' })))).toEqual({
+      kind: 'notes',
+      notes: [['warning', 'mode fallback']]
+    })
+  })
+
+  test('diffOutputPlan: tail-capped echo that LOST the JSON head (normalized to diff lines) is suppressed', () => {
+    // A long file-edit JSON tail-capped past its `{"success"…` head: the store
+    // un-escapes the literal \n so it arrives as plain lines that ARE diff
+    // lines (first/last cut mid-line) — live bug shape from the v6 smoke.
+    const tallDiff = [
+      '--- a/x.py',
+      '+++ b/x.py',
+      '@@ -1,1 +1,9 @@',
+      ' ctx',
+      ...Array.from({ length: 8 }, (_, i) => `+def fn_${i}() -> int: return ${i}`)
+    ].join('\n')
+    const echoTail = [
+      'n 1', // cut mid-line
+      ...Array.from({ length: 6 }, (_, i) => `+def fn_${i + 2}() -> int: return ${i + 2}`),
+      '", "files_modified": ["/p/x.py' // cut mid-JSON
+    ].join('\n')
+    expect(diffOutputPlan({ ...part(echoTail), diffUnified: tallDiff })).toEqual({ kind: 'suppress' })
+    // …but a genuine plain-text tail sharing no lines with the diff still renders
+    const lintTail = ['x.py:3: W291 trailing whitespace', 'x.py:9: E302 expected 2 blank lines', '2 warnings'].join(
+      '\n'
+    )
+    expect(diffOutputPlan({ ...part(lintTail), diffUnified: tallDiff })).toEqual({ kind: 'output' })
+  })
+
+  test('TRUNCATED JSON result under a rendered diff → NO output block in the frame', async () => {
+    const capped = '{"success": true, "diff": "--- a/x.py\\n+++ b/x.py\\n@@ -1,2 +1'
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider>
+          <FileToolBody part={part(capped)} width={70} />
+        </ThemeProvider>
+      ),
+      { width: 80, height: 16 }
+    )
+    try {
+      // wait for the native <diff> to paint (Tree-sitter settles async)
+      const frame = await probe.waitForFrame(f => f.includes('new'))
+      expect(frame).not.toContain('output') // no output section label
+      expect(frame).not.toContain('{"') // and never raw JSON
+      expect(frame).not.toContain('success')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('plain-text result under a rendered diff → output block still shown', async () => {
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider>
+          <FileToolBody part={part('warning: trailing whitespace on line 3')} width={70} />
+        </ThemeProvider>
+      ),
+      { width: 80, height: 16 }
+    )
+    try {
+      const frame = await probe.waitForFrame(f => f.includes('trailing whitespace'))
+      expect(frame).toContain('output') // labeled output section
+      expect(frame).toContain('warning: trailing whitespace on line 3')
+    } finally {
+      probe.destroy()
+    }
   })
 })
 

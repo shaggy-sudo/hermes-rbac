@@ -241,6 +241,40 @@ def test_tool_complete_emits_full_unified_diff(monkeypatch):
     assert "inline_diff" in payload
 
 
+def test_verbose_result_text_drops_diff_echo_when_diff_unified_ships(monkeypatch):
+    # A tall edit's result JSON embeds the WHOLE diff; tail-capping that echo
+    # yields an unparseable JSON-looking fragment the TUI can't suppress
+    # reliably. When diff_unified ships, result_text must carry only the
+    # non-diff signal — small, parseable, never the diff echo.
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "diff-echo-test",
+        {"tool_progress_mode": "verbose", "tool_started_at": {}, "edit_snapshots": {}},
+    )
+
+    lines = "\n".join(f"+def fn_{i}() -> int: return {i}" for i in range(60))
+    diff = f"--- a/x.py\n+++ b/x.py\n@@ -1,0 +1,60 @@\n{lines}\n"
+    result = json.dumps(
+        {"success": True, "diff": diff, "files_modified": ["x.py"], "_warning": "stale read"}
+    )
+    server._on_tool_complete("diff-echo-test", "tool-1", "patch", {"mode": "patch"}, result)
+
+    payload = events[0][2]
+    assert payload["diff_unified"] == diff
+    text = payload["result_text"]
+    assert "[showing verbose tail" not in text  # small enough to dodge the cap
+    parsed = json.loads(text)  # parseable …
+    assert "diff" not in parsed  # … with the echo gone
+    assert parsed["_warning"] == "stale read"  # non-diff signal survives
+    # without diff_unified (non-edit tools) the result_text is untouched
+    assert server._result_sans_diff_echo("plain text result") == "plain text result"
+    assert server._result_sans_diff_echo('{"output": "x"}') == '{"output": "x"}'
+
+
 def test_cap_diff_unified_truncates_at_line_boundary():
     line = "+" + "x" * 63  # 64 bytes per line incl. newline
     diff = "\n".join([line] * 100)
