@@ -24,6 +24,12 @@ jobs:
         with:
           fetch-depth: 0
           ref: main
+          # Upstream main carries .github/workflows/* files; the default
+          # GITHUB_TOKEN is forbidden from pushing workflow files, so use a
+          # PAT (classic, scopes: repo + workflow) stored as the SYNC_TOKEN
+          # secret. Falls back to the default token (works only if upstream
+          # has no workflow changes since the last sync).
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: Fetch upstream
         run: |
