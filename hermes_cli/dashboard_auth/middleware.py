@@ -180,22 +180,14 @@ def _apply_rbac_lock(session):
     from hermes_cli.dashboard_auth import rbac_map
 
     email = getattr(session, "email", "") or ""
-    if not email or rbac_map.is_admin(email):
-        return (rbac_map.set_lock(None), rbac_map.set_shared_roots(()))
-    # First login provisions the user's profile (private FS + role shared FS).
-    rbac_map.ensure_user_profile(email)
-    role = rbac_map.role_for_email(email)
-    lock_tok = rbac_map.set_lock(rbac_map.profile_for_email(email))
-    shared_tok = rbac_map.set_shared_roots(rbac_map.shared_dirs_for_role(role))
-    return (lock_tok, shared_tok)
+    # Delegate to the shared helper so HTTP + WS lock-application can't drift.
+    return rbac_map.lock_tokens_for_email(email)
 
 
 def _release_rbac_lock(tokens) -> None:
     from hermes_cli.dashboard_auth import rbac_map
 
-    lock_tok, shared_tok = tokens
-    rbac_map.reset_lock(lock_tok)
-    rbac_map.reset_shared_roots(shared_tok)
+    rbac_map.release_lock_tokens(tokens)
 
 
 async def gated_auth_middleware(

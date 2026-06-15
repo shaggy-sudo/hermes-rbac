@@ -31,6 +31,40 @@ could not provide.
 | Memory | profile `MEMORY.md` | `/shared/MEMORY.md` (injected via hook) |
 | Skills | profile `skills/` | `rbac/shared-skills/<bundle>` (read-only) |
 
+## Security & isolation guarantees
+
+A non-admin request runs under a request-scoped **profile lock** (set from the
+authenticated email). Every data surface confines to the locked profile + the
+role's `/shared`:
+
+| Surface | Confinement |
+|---------|-------------|
+| Files (`/api/fs/*`, `/api/files`) | own profile home + role `/shared` only |
+| Env / secrets (`/api/env*`) | own profile `.env`; reveal/write never reach another profile |
+| Config / skills / toolsets / memory | resolved through the lock even when `?profile=` is omitted |
+| Sessions (`/api/sessions*`, `/api/profiles/sessions`) | only the locked profile's `state.db` |
+| Logs, media, cron | scoped to the locked profile |
+| Chat / agent (`/api/pty`, `/api/ws`, `/api/pub`, `/api/events`) | WS ticket carries the verified email; the lock is re-applied for the socket lifetime, so `?profile=<other>` cannot escape, and pub/sub channels are namespaced per tenant |
+| Profile lifecycle (create/rename/delete/set-active) | **admin-only** (403 under a lock) |
+
+Admins (allowlist `HERMES_ADMIN_EMAILS`) and the loopback/`--insecure`
+single-operator mode run **unlocked** — unrestricted, as before.
+
+Operational hard requirements:
+- **`ROUTER_SECRET`** must be a high-entropy value (≥32 chars); the router
+  *refuses to start* otherwise (`openssl rand -hex 32`). A weak/default secret
+  would let anyone forge a session cookie for any email.
+- **Shared `rw`/`ro`** per role is enforced at the mount: `ro` roles get
+  `/shared` mounted read-only. The flag lives in
+  `<HERMES_HOME>/rbac/shared-access.json` (managed from the `/rbac` console);
+  bind mode is fixed at container creation, so toggling it requires respawning
+  the affected role's containers.
+
+Regression coverage: `rbac/test_rbac_endpoint_confinement.py` (locked vs
+unlocked endpoint behavior), `rbac/test_rbac_admin_routes.py` (admin gate +
+CRUD + CSRF), and `tests/hermes_cli/test_dashboard_auth_ws_auth.py` (WS ticket
+email propagation + channel namespacing).
+
 ## Docs
 - **[rbac/README.md](rbac/README.md)** — RBAC model, roles, provisioning
 - **[rbac/AUTH.md](rbac/AUTH.md)** — Google OAuth gate setup (Cloud Console, redirect URI)
@@ -65,6 +99,8 @@ Google OAuth client, then open the public URL and log in.
 | `hermes_cli/dashboard_auth/google/` | Google `DashboardAuthProvider` plugin |
 | `hermes_cli/dashboard_auth/rbac_map.py` | email→profile/role, profile lock |
 | `hermes_cli/dashboard_auth/rbac_admin.py` | Shared Management admin UI (`/rbac`) |
+| `hermes_cli/dashboard_auth/rbac_admin.py` | `/rbac` admin console (roles CRUD, members, shared files/memory, permissions) |
+| `<HERMES_HOME>/rbac/shared-access.json` | per-role `rw`/`ro` shared-volume flag (managed in the console) |
 | `docker-compose.router.yml` | router service (the production front door) |
 | `docker-compose.mac.yml` | legacy machine-level dashboard (admin) |
 

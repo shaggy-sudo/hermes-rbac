@@ -5,12 +5,13 @@
  * Renders nothing in loopback / --insecure mode. In gated mode, fetches
  * /api/auth/me on mount and surfaces:
  *
- *   - the user_id (truncated to 14 chars + ellipsis) since the Nous Portal
- *     contract V1 doesn't emit email/display_name claims (Contract Anchor
- *     C4 in the plan; the API responds with empty strings for those
- *     fields, so we use user_id as the display value)
- *   - the provider's display_name (looked up from /api/auth/providers,
- *     defaults to the bare provider key)
+ *   - the human identity: ``display_name`` and/or ``email`` as populated by
+ *     the provider (the Google provider supplies both). The truncated
+ *     ``user_id`` is only used as a last-resort fallback when neither claim
+ *     is present.
+ *   - the caller's RBAC role as a pill ("Viewer", "Developer", …), plus an
+ *     "Admin" pill for infra/console admins (``is_admin``), so the user can
+ *     see who they are in RBAC terms.
  *   - a logout button that POSTs /auth/logout and full-page-navigates to
  *     /login (the dashboard becomes inaccessible again)
  *
@@ -23,8 +24,8 @@
  *     so the user knows the widget tried.
  */
 
-import { useEffect, useState } from "react";
-import { api, type AuthMeResponse } from "@/lib/api";
+import { api } from "@/lib/api";
+import { useAuthMe } from "@/hooks/useAuthMe";
 import { cn } from "@/lib/utils";
 import { LogOut } from "lucide-react";
 
@@ -34,43 +35,20 @@ interface AuthWidgetProps {
 
 /** Truncate ``user_id`` to fit a small UI without revealing the full
  *  opaque identifier. 14 chars is enough to disambiguate users in a
- *  small org and short enough to fit a single sidebar row. */
+ *  small org and short enough to fit a single sidebar row. Only used as a
+ *  last resort when the provider supplied no display_name/email. */
 function truncateUserId(id: string): string {
   if (id.length <= 14) return id;
   return `${id.slice(0, 14)}…`;
 }
 
-export function AuthWidget({ className }: AuthWidgetProps) {
-  const [me, setMe] = useState<AuthMeResponse | null>(null);
-  const [hidden, setHidden] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+/** Title-case an RBAC role slug for display ("viewer" → "Viewer"). */
+function formatRole(role: string): string {
+  return role.charAt(0).toUpperCase() + role.slice(1);
+}
 
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getAuthMe()
-      .then((data) => {
-        if (cancelled) return;
-        setMe(data);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        // 401 from /api/auth/me means the gate isn't engaged in this
-        // process (loopback mode) — render nothing. fetchJSON throws an
-        // Error with the status code as a prefix; the global 401
-        // handler only redirects on the structured envelope, so a plain
-        // 401 from /api/auth/me with no envelope bubbles up here.
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.startsWith("401:") || msg.startsWith("403:")) {
-          setHidden(true);
-          return;
-        }
-        setError("auth status unavailable");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+export function AuthWidget({ className }: AuthWidgetProps) {
+  const { me, hidden, error } = useAuthMe();
 
   if (hidden) return null;
 
@@ -107,10 +85,14 @@ export function AuthWidget({ className }: AuthWidgetProps) {
     void api.logout();
   };
 
-  // Prefer display_name → email → truncated user_id. Contract V1 only
-  // populates user_id; the fallthroughs are forward-compat for a future
-  // Portal that adds a userinfo endpoint (OQ-C1 in the plan).
+  // Prefer display_name → email → truncated user_id. Providers like Google
+  // populate display_name + email; the user_id fallback is the last resort
+  // for providers that emit neither.
   const label = me.display_name || me.email || truncateUserId(me.user_id);
+  // Show the email as a secondary line only when it adds information beyond
+  // the primary label (i.e. when display_name is what we're showing).
+  const subLabel = me.display_name && me.email ? me.email : null;
+  const roleLabel = me.role ? formatRole(me.role) : null;
 
   return (
     <div
@@ -122,14 +104,35 @@ export function AuthWidget({ className }: AuthWidgetProps) {
         className,
       )}
       role="status"
-      aria-label={`Logged in as ${label}`}
+      aria-label={`Logged in as ${label}${roleLabel ? `, role ${roleLabel}` : ""}`}
     >
-      <div className="flex min-w-0 flex-col">
-        <span className="truncate font-mono text-foreground/90" title={me.user_id}>
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <span className="truncate font-mono text-foreground/90" title={me.email || me.user_id}>
           {label}
         </span>
-        <span className="truncate text-muted-foreground/70">
-          via {me.provider}
+        {subLabel ? (
+          <span className="truncate text-muted-foreground/70" title={subLabel}>
+            {subLabel}
+          </span>
+        ) : null}
+        <span className="mt-0.5 flex flex-wrap items-center gap-1">
+          {roleLabel ? (
+            <span
+              className="rounded-sm border border-current/20 bg-current/5 px-1.5 py-px font-mondwest text-display uppercase tracking-[0.08em] text-text-secondary"
+              title={`RBAC role: ${roleLabel}`}
+            >
+              {roleLabel}
+            </span>
+          ) : null}
+          {me.is_admin ? (
+            <span
+              className="rounded-sm border border-amber-500/40 bg-amber-500/10 px-1.5 py-px font-mondwest text-display uppercase tracking-[0.08em] text-amber-300"
+              title="Infrastructure / console admin"
+            >
+              Admin
+            </span>
+          ) : null}
+          <span className="truncate text-muted-foreground/60">via {me.provider}</span>
         </span>
       </div>
       <button

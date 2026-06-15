@@ -5,6 +5,13 @@
 #
 #   docker exec hermes bash /opt/hermes/rbac/provision-user.sh alice@acme.com developer
 #
+# Role resolution: a [role] passed on the command line is used as-is, and an
+# unknown role falls back to "viewer" (see the heredoc below). When no role is
+# given here the manual-run default is "viewer". Auto-provisioning (gateway /
+# dashboard) instead resolves the role via rbac_map.role_for_email, which
+# honours the HERMES_DEFAULT_ROLE env var; pass that role explicitly to mirror
+# the auto path from a manual run.
+#
 # Two-tier filesystem result for the user's profile:
 #   private (per-user) : the profile's own HERMES_HOME (memory/skills/sessions)
 #                        + own docker container home (home_mode=profile).
@@ -56,11 +63,35 @@ CONFIG="$PROFILE_HOME/config.yaml"
 MODEL="${HERMES_DEFAULT_MODEL:-openrouter/owl-alpha}"
 
 RBAC_DIR="$RBAC_DIR" ROLE="$ROLE" TOOLSETS="$TOOLSETS" BACKEND="$BACKEND" \
-SHARED="$SHARED" SHARED_HOST="$SHARED_HOST" CONFIG="$CONFIG" MODEL="$MODEL" "$PY" - <<'PY'
-import os, yaml, pathlib
+SHARED="$SHARED" SHARED_HOST="$SHARED_HOST" CONFIG="$CONFIG" MODEL="$MODEL" \
+ROLES_YAML="$ROLES_YAML" HOME_ROOT="$HOME_ROOT" "$PY" - <<'PY'
+import os, json, yaml, pathlib
 cfg_path = pathlib.Path(os.environ["CONFIG"])
 cfg = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
 cfg = cfg or {}
+
+# Effective shared-volume access for this role: the admin console side file
+# (<HERMES_HOME>/rbac/shared-access.json, role -> "rw"|"ro") wins; else the
+# roles.yaml shared_access key for the role; else default "rw". Mirrors
+# rbac_admin._shared_access_for so the script enforces what the console shows.
+def _shared_access(role):
+    val = ""
+    side_path = pathlib.Path(os.environ["HOME_ROOT"]) / "rbac" / "shared-access.json"
+    try:
+        side = json.loads(side_path.read_text())
+    except Exception:
+        side = None
+    if isinstance(side, dict) and role in side:
+        val = str(side[role]).strip().lower()
+    if val not in ("rw", "ro"):
+        try:
+            roles = yaml.safe_load(pathlib.Path(os.environ["ROLES_YAML"]).read_text())["roles"]
+        except Exception:
+            roles = {}
+        spec = roles.get(role) if isinstance(roles, dict) else None
+        if isinstance(spec, dict):
+            val = str(spec.get("shared_access", "")).strip().lower()
+    return val if val in ("rw", "ro") else "rw"
 
 toolsets = os.environ["TOOLSETS"].split(",")
 platforms = ["cli", "telegram", "discord", "whatsapp", "slack", "signal"]
@@ -73,11 +104,23 @@ if os.environ["BACKEND"] == "docker":
     term.setdefault("docker_image", "nikolaik/python-nodejs:python3.11-nodejs20")
     term["container_persistent"] = True
     # Mount the shared role volume into the user's container at /shared.
+    # Honour the role's effective rw/ro access (admin console / roles.yaml).
+    access = _shared_access(os.environ["ROLE"])
+    bind = f"{os.environ['SHARED_HOST']}:/shared" + (":ro" if access == "ro" else "")
     extra = term.get("docker_extra_args", []) or []
-    mount = ["-v", f"{os.environ['SHARED_HOST']}:/shared"]
-    if mount[1] not in extra:
-        extra += mount
-    term["docker_extra_args"] = extra
+    # Drop any stale /shared bind (rw<->ro toggled) so re-provisioning stays
+    # idempotent, then append the bind with the effective access mode.
+    rebuilt = []
+    i = 0
+    while i < len(extra):
+        if (extra[i] == "-v" and i + 1 < len(extra)
+                and extra[i + 1].split(":")[1:2] == ["/shared"]):
+            i += 2
+            continue
+        rebuilt.append(extra[i])
+        i += 1
+    rebuilt += ["-v", bind]
+    term["docker_extra_args"] = rebuilt
 
 # Role shared-skills, read-only, on top of the user's own private skills/.
 rbac_dir = os.environ["RBAC_DIR"]
@@ -103,7 +146,8 @@ cfg["hooks_auto_accept"] = True
 
 cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
 print(f"   private FS : {cfg_path.parent}")
-print(f"   shared FS  : {os.environ['SHARED_HOST']} -> /shared (role {os.environ['ROLE']})")
+print(f"   shared FS  : {os.environ['SHARED_HOST']} -> /shared "
+      f"({_shared_access(os.environ['ROLE'])}, role {os.environ['ROLE']})")
 print(f"   toolsets   : {toolsets}")
 PY
 
@@ -111,8 +155,9 @@ PY
 if [ -n "${OPENROUTER_API_KEY:-}" ]; then
     touch "$PROFILE_HOME/.env"
     grep -v '^OPENROUTER_API_KEY=' "$PROFILE_HOME/.env" > "$PROFILE_HOME/.env.tmp" 2>/dev/null || true
+    printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY" >> "$PROFILE_HOME/.env.tmp"
+    chmod 600 "$PROFILE_HOME/.env.tmp"
     mv "$PROFILE_HOME/.env.tmp" "$PROFILE_HOME/.env"
-    printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY" >> "$PROFILE_HOME/.env"
     echo "   seeded OPENROUTER_API_KEY into profile .env"
 fi
 

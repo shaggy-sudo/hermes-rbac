@@ -1151,11 +1151,34 @@ def _media_serve_roots() -> list[Path]:
     client from reading image-extension files anywhere on disk (e.g. a renamed
     key or a screenshot outside the cache) merely because the suffix passes the
     allowlist.
+
+    RBAC: a pinned (non-admin) user must read media ONLY from their OWN profile
+    home (plus their role's shared roots), never the dashboard's default-profile
+    media. When a lock is active, base the media roots on the locked profile dir
+    and append the role's shared roots from ``fs_roots()``. Unlocked
+    (admin/loopback) uses the live ``get_hermes_home()`` exactly as before.
     """
-    home = get_hermes_home()
-    roots = [home / "images", home / "screenshots", home / "cache"]
+    from hermes_cli.dashboard_auth.rbac_map import get_lock, get_shared_roots
+
+    locked = get_lock()
+    if locked:
+        from hermes_cli import profiles as profiles_mod
+        home = profiles_mod.get_profile_dir(locked)
+        media_dirs = [home / "images", home / "screenshots", home / "cache"]
+        # Shared (per-role) roots a locked user may also browse — surface their
+        # media subtrees too without exposing other tenants.
+        for shared in get_shared_roots():
+            shared_path = Path(shared)
+            media_dirs.extend([
+                shared_path / "images",
+                shared_path / "screenshots",
+                shared_path / "cache",
+            ])
+    else:
+        home = get_hermes_home()
+        media_dirs = [home / "images", home / "screenshots", home / "cache"]
     out: list[Path] = []
-    for root in roots:
+    for root in media_dirs:
         try:
             out.append(root.resolve())
         except (OSError, RuntimeError):
@@ -2713,9 +2736,18 @@ async def get_profiles_sessions(
 
     from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
+    from hermes_cli.dashboard_auth.rbac_map import get_lock
 
     targets: List[Tuple[str, Path]] = []
-    if profile and profile != "all":
+    locked = get_lock()
+    if locked:
+        # RBAC: a pinned (non-admin) user may only ever see their OWN profile's
+        # sessions. ``profile=all`` (or any other ?profile=) would otherwise
+        # enumerate every tenant's state.db (titles + previews); force the
+        # single locked profile regardless of the requested value.
+        name, home = _cron_profile_home(locked)
+        targets.append((name, home))
+    elif profile and profile != "all":
         name, home = _cron_profile_home(profile)
         targets.append((name, home))
     else:
@@ -6315,13 +6347,18 @@ async def cancel_oauth_session(session_id: str, request: Request):
 
 
 
-def _session_latest_descendant(session_id: str):
+def _session_latest_descendant(session_id: str, profile: Optional[str] = None):
     """Resolve a session id to the newest child leaf session.
 
     /model may create child sessions. Dashboard refresh should continue the
     newest child instead of reopening the old parent.
+
+    Routes the DB open through ``_open_session_db_for_profile`` so a pinned
+    (non-admin) user resolves against their OWN profile's ``state.db`` (and an
+    explicit ``?profile=`` is enforced), matching the sibling
+    ``/api/sessions/{id}`` routes. Unlocked (admin/loopback) with no profile
+    opens this process's own ``state.db`` exactly as before.
     """
-    from hermes_state import SessionDB
 
     def row_get(row, key, index):
         if isinstance(row, dict):
@@ -6334,7 +6371,7 @@ def _session_latest_descendant(session_id: str):
             except Exception:
                 return None
 
-    db = SessionDB()
+    db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
         if not sid or not db.get_session(sid):
@@ -6568,8 +6605,8 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
 
 
 @app.get("/api/sessions/{session_id}/latest-descendant")
-async def get_session_latest_descendant(session_id: str):
-    latest, path = _session_latest_descendant(session_id)
+async def get_session_latest_descendant(session_id: str, profile: Optional[str] = None):
+    latest, path = _session_latest_descendant(session_id, profile)
     if not latest:
         raise HTTPException(status_code=404, detail="Session not found")
     return {
@@ -6708,7 +6745,18 @@ async def get_logs(
     log_name = LOG_FILES.get(file)
     if not log_name:
         raise HTTPException(status_code=400, detail=f"Unknown log file: {file}")
-    log_path = get_hermes_home() / "logs" / log_name
+    # RBAC: a pinned (non-admin) user reads ONLY their own profile's logs
+    # (agent/gateway logs carry prompts + tool calls). Base the logs dir on the
+    # locked profile dir when a lock is active; unlocked (admin/loopback) uses
+    # the live ``get_hermes_home()`` exactly as before.
+    from hermes_cli.dashboard_auth.rbac_map import get_lock as _get_lock
+    _locked = _get_lock()
+    if _locked:
+        from hermes_cli import profiles as profiles_mod
+        logs_home = profiles_mod.get_profile_dir(_locked)
+    else:
+        logs_home = get_hermes_home()
+    log_path = logs_home / "logs" / log_name
     if not log_path.exists():
         return {"file": file, "lines": []}
 
@@ -6850,7 +6898,17 @@ def _find_cron_job_profile(job_id: str) -> Optional[str]:
 
 @app.get("/api/cron/jobs")
 async def list_cron_jobs(profile: str = "all"):
+    from hermes_cli.dashboard_auth.rbac_map import get_lock
+
     requested = (profile or "all").strip()
+    # RBAC: a pinned (non-admin) user only ever has one profile. ``enforce``
+    # inside ``_call_cron_for_profile`` already confines reads to it, but the
+    # ``all`` path would loop every profile and return the locked user's jobs
+    # duplicated once per profile (plus leak the profile COUNT). Collapse to the
+    # single locked profile. Unlocked (admin/loopback) keeps the full loop.
+    locked = get_lock()
+    if locked:
+        return _call_cron_for_profile(locked, "list_jobs", True)
     if requested.lower() != "all":
         return _call_cron_for_profile(requested, "list_jobs", True)
 
@@ -7822,33 +7880,68 @@ class MemoryReset(BaseModel):
     target: str = "all"
 
 
+@contextmanager
+def _memory_scope(profile: Optional[str]):
+    """Scope memory dir + ``load_config``/``save_config`` to the right profile.
+
+    RBAC: a pinned (non-admin) user must read/write ONLY their own profile's
+    ``memories/`` (MEMORY.md, USER.md) and ``memory`` config — without this they
+    fall through to the dashboard's default-profile home. The requested value is
+    run through ``enforce``, so a lock forces the locked profile and an admin can
+    still target via ``?profile=``. When the resolved profile differs from the
+    live home we set the context-local HERMES_HOME override (mirroring
+    ``_write_profile_model``) so ``load_config``/``save_config`` retarget. Yields
+    the profile's ``memories`` directory. Unlocked + no profile leaves the home
+    untouched (``get_hermes_home()``) exactly as before.
+    """
+    from hermes_constants import (
+        get_hermes_home,
+        set_hermes_home_override,
+        reset_hermes_home_override,
+    )
+    from hermes_cli.dashboard_auth.rbac_map import enforce
+
+    requested = (enforce((profile or "").strip()) or "").strip()
+    token = None
+    if not requested or requested.lower() == "current":
+        mem_home = get_hermes_home()
+    else:
+        mem_home = _resolve_profile_dir(requested)
+        token = set_hermes_home_override(str(mem_home))
+    try:
+        yield mem_home / "memories"
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
 @app.get("/api/memory")
-async def get_memory_status():
+async def get_memory_status(profile: Optional[str] = None):
     from plugins.memory import discover_memory_providers
 
-    cfg = load_config()
-    active = ""
-    mem = cfg.get("memory")
-    if isinstance(mem, dict):
-        active = str(mem.get("provider") or "")
+    with _memory_scope(profile) as mem_dir:
+        cfg = load_config()
+        active = ""
+        mem = cfg.get("memory")
+        if isinstance(mem, dict):
+            active = str(mem.get("provider") or "")
 
-    providers = []
-    try:
-        for name, description, configured in discover_memory_providers():
-            providers.append({
-                "name": name,
-                "description": description,
-                "configured": bool(configured),
-            })
-    except Exception:
-        _log.exception("discover_memory_providers failed")
+        providers = []
+        try:
+            for name, description, configured in discover_memory_providers():
+                providers.append({
+                    "name": name,
+                    "description": description,
+                    "configured": bool(configured),
+                })
+        except Exception:
+            _log.exception("discover_memory_providers failed")
 
-    # Built-in memory file sizes (so the UI can show what a reset would erase).
-    mem_dir = get_hermes_home() / "memories"
-    files = {}
-    for fname, key in (("MEMORY.md", "memory"), ("USER.md", "user")):
-        path = mem_dir / fname
-        files[key] = path.stat().st_size if path.exists() else 0
+        # Built-in memory file sizes (so the UI can show what a reset would erase).
+        files = {}
+        for fname, key in (("MEMORY.md", "memory"), ("USER.md", "user")):
+            path = mem_dir / fname
+            files[key] = path.stat().st_size if path.exists() else 0
 
     return {
         "active": active,
@@ -7858,7 +7951,7 @@ async def get_memory_status():
 
 
 @app.put("/api/memory/provider")
-async def set_memory_provider(body: MemoryProviderSelect):
+async def set_memory_provider(body: MemoryProviderSelect, profile: Optional[str] = None):
     provider = (body.provider or "").strip()
     if provider.lower() in {"built-in", "builtin", "none"}:
         provider = ""
@@ -7873,21 +7966,26 @@ async def set_memory_provider(body: MemoryProviderSelect):
                 detail=f"Unknown memory provider '{provider}'. Run `hermes memory setup` to configure a new one.",
             )
 
-    cfg = load_config()
-    if not isinstance(cfg.get("memory"), dict):
-        cfg["memory"] = {}
-    cfg["memory"]["provider"] = provider
-    save_config(cfg)
+    with _memory_scope(profile):
+        cfg = load_config()
+        if not isinstance(cfg.get("memory"), dict):
+            cfg["memory"] = {}
+        cfg["memory"]["provider"] = provider
+        save_config(cfg)
     return {"ok": True, "active": provider}
 
 
 @app.post("/api/memory/reset")
-async def reset_memory(body: MemoryReset):
+async def reset_memory(body: MemoryReset, profile: Optional[str] = None):
     target = (body.target or "all").strip().lower()
     if target not in {"all", "memory", "user"}:
         raise HTTPException(status_code=400, detail="target must be all, memory, or user")
 
-    mem_dir = get_hermes_home() / "memories"
+    with _memory_scope(profile) as mem_dir:
+        return _reset_memory_files(target, mem_dir)
+
+
+def _reset_memory_files(target: str, mem_dir: Path) -> Dict[str, Any]:
     deleted = []
     targets = []
     if target in {"all", "memory"}:
@@ -8900,8 +8998,21 @@ async def list_profiles_endpoint():
     return {"profiles": _rbac_filter_profiles(items)}
 
 
+def _require_no_lock_for_profile_admin() -> None:
+    """Profile lifecycle ops (create/clone/rename/delete/set-active) are
+    machine-level and admin-only. A pinned (non-admin) user has an active RBAC
+    lock — reject outright with 403. We do NOT route these through ``enforce``:
+    silently retargeting a rename/delete to the caller's own profile would be
+    destructive. No-lock (admin/loopback) path is unaffected."""
+    from hermes_cli.dashboard_auth.rbac_map import get_lock
+
+    if get_lock():
+        raise HTTPException(status_code=403, detail="Profile management is admin-only")
+
+
 @app.post("/api/profiles")
 async def create_profile_endpoint(body: ProfileCreate):
+    _require_no_lock_for_profile_admin()
     from hermes_cli import profiles as profiles_mod
     explicit_source = (body.clone_from or "").strip()
     if explicit_source:
@@ -9041,6 +9152,7 @@ async def set_active_profile_endpoint(body: ProfileActiveUpdate):
     Note: this does not retarget the already-running dashboard process —
     it changes which profile subsequent CLI commands and gateways use.
     """
+    _require_no_lock_for_profile_admin()
     from hermes_cli import profiles as profiles_mod
     try:
         profiles_mod.set_active_profile(body.name)
@@ -9115,6 +9227,7 @@ async def open_profile_terminal_endpoint(name: str):
 
 @app.patch("/api/profiles/{name}")
 async def rename_profile_endpoint(name: str, body: ProfileRename):
+    _require_no_lock_for_profile_admin()
     from hermes_cli import profiles as profiles_mod
     try:
         path = profiles_mod.rename_profile(name, body.new_name)
@@ -9133,6 +9246,7 @@ async def delete_profile_endpoint(name: str):
     """Delete a profile. The dashboard collects the user's confirmation in
     its own dialog before this request, so we always pass ``yes=True`` to
     skip the CLI's interactive prompt."""
+    _require_no_lock_for_profile_admin()
     from hermes_cli import profiles as profiles_mod
     try:
         path = profiles_mod.delete_profile(name, yes=True)
@@ -9276,8 +9390,17 @@ def _profile_scope(profile: Optional[str]):
     live home even when the import-time binding is stale (e.g. the process
     imported the modules before a HERMES_HOME override, or under test
     isolation).
+
+    RBAC: the requested value is run through ``enforce()`` first, so a pinned
+    (non-admin) user who omits ``?profile=`` — or passes ``current``/another
+    profile — is forced onto their own locked profile rather than falling
+    through to the default ``get_hermes_home()`` (which would expose the
+    default profile's .env secrets, config, skills, toolsets). When unlocked
+    (admin/loopback) ``enforce`` returns the requested value unchanged, so the
+    no-lock path is identical to before.
     """
-    requested = (profile or "").strip()
+    from hermes_cli.dashboard_auth.rbac_map import enforce
+    requested = (enforce((profile or "").strip()) or "").strip()
 
     from hermes_constants import (
         get_hermes_home,
@@ -10023,7 +10146,12 @@ else:
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
-_VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# ``~`` is permitted so the RBAC profile-namespace separator used by
+# _namespace_channel (``<profile>~<id>``) survives channel validation: the
+# server-spawned PTY child publishes on the already-namespaced channel, and
+# namespacing always re-prefixes a locked user's channel with their OWN
+# profile, so allowing ``~`` in client input cannot reach another tenant.
+_VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
 # Starlette's TestClient reports the peer as "testclient"; treat it as
 # loopback so tests don't need to rewrite request scope.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
@@ -10157,12 +10285,15 @@ def _ws_auth_mode() -> str:
     return "loopback"
 
 
-def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
-    """Validate WS-upgrade auth; return ``(reason, credential)``.
+def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str, Optional[str]]:
+    """Validate WS-upgrade auth; return ``(reason, credential, email)``.
 
     ``reason`` is None when the credential is accepted, else a short
     machine-parseable token explaining the rejection (``no_credential``,
     ``token_mismatch``, ``ticket_invalid``, ``internal_invalid``).
+    ``email`` is the verified session email carried by an accepted browser
+    ticket (so the WS handler can apply the per-user RBAC lock), or ``None`` for
+    server-internal / loopback / ``--insecure`` / rejected paths.
     ``credential`` names which credential type was presented (``ticket``,
     ``internal``, ``token``, or ``none``) so the accepted path can log *how*
     a peer authed, not just that it did.
@@ -10207,7 +10338,9 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         if internal:
             try:
                 consume_internal_credential(internal)
-                return None, "internal"
+                # Server-spawned child: no real user, so no RBAC lock — these
+                # internal WS links stay unrestricted, as before.
+                return None, "internal", None
             except TicketInvalid as exc:
                 audit_log(
                     AuditEvent.WS_TICKET_REJECTED,
@@ -10215,15 +10348,18 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                     ip=(ws.client.host if ws.client else ""),
                     path=ws.url.path,
                 )
-                return "internal_invalid", "internal"
+                return "internal_invalid", "internal", None
 
         ticket = ws.query_params.get("ticket", "")
         if not ticket:
-            return "no_credential", "none"
+            return "no_credential", "none", None
 
         try:
-            consume_ticket(ticket)
-            return None, "ticket"
+            info = consume_ticket(ticket)
+            # Carry the ticket owner's verified email out so the WS handler can
+            # apply the per-user RBAC lock (the session cookie does not reach
+            # the WS route the way it does HTTP middleware).
+            return None, "ticket", (info.get("email") if isinstance(info, dict) else None)
         except TicketInvalid as exc:
             audit_log(
                 AuditEvent.WS_TICKET_REJECTED,
@@ -10231,19 +10367,43 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 ip=(ws.client.host if ws.client else ""),
                 path=ws.url.path,
             )
-            return "ticket_invalid", "ticket"
+            return "ticket_invalid", "ticket", None
 
     token = ws.query_params.get("token", "")
     if not token:
-        return "no_credential", "none"
+        return "no_credential", "none", None
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
-        return None, "token"
-    return "token_mismatch", "token"
+        return None, "token", None
+    return "token_mismatch", "token", None
 
 
 def _ws_auth_ok(ws: "WebSocket") -> bool:
     """True when the WS-upgrade credential is accepted. See _ws_auth_reason."""
     return _ws_auth_reason(ws)[0] is None
+
+
+@contextmanager
+def _ws_rbac_lock(email: Optional[str]):
+    """Apply the per-user RBAC lock for the duration of a WebSocket.
+
+    The HTTP middleware applies the lock per-request, but WS handlers run
+    outside that middleware, so an authenticated non-admin user could otherwise
+    pass ``?profile=<other>`` and reach another tenant. When the accepted ticket
+    carries a real user email and that user is NOT an admin, pin the lock (+
+    shared roots) here so the downstream ``enforce`` / ``_resolve_profile_dir``
+    confine the socket; reset on close. ``email`` of None (server-internal) or an
+    admin leaves the context UNLOCKED — unchanged behavior.
+    """
+    from hermes_cli.dashboard_auth import rbac_map
+
+    tokens = None
+    if email and not rbac_map.is_admin(email):
+        tokens = rbac_map.lock_tokens_for_email(email)
+    try:
+        yield
+    finally:
+        if tokens is not None:
+            rbac_map.release_lock_tokens(tokens)
 
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -10424,6 +10584,22 @@ def _channel_or_close_code(ws: WebSocket) -> Optional[str]:
     return channel if _VALID_CHANNEL_RE.match(channel) else None
 
 
+def _namespace_channel(channel: str, profile: Optional[str]) -> str:
+    """Prefix a browser-generated channel id with the owning profile.
+
+    RBAC: /api/pub + /api/events keys are opaque ids the browser mints, shared
+    across the whole single-process dashboard. Without namespacing, a non-admin
+    could pub/sub on another tenant's channel id (cross-talk / event leak).
+    Prefixing by the authenticated profile confines a locked user to channels
+    within their own tenant. ``profile`` None (admin / loopback / server-
+    internal) returns the channel unchanged — behavior is identical to before.
+    The prefix uses ``~`` which is outside ``_VALID_CHANNEL_RE`` so it can never
+    collide with a client-chosen id."""
+    if not profile:
+        return channel
+    return f"{profile}~{channel}"
+
+
 def _ws_close_reason(text: str) -> str:
     """Clamp a WS close reason to the protocol's 123-byte UTF-8 limit.
 
@@ -10452,7 +10628,7 @@ async def pty_ws(ws: WebSocket) -> None:
     #     browser banner agree on the cause:
     #       4401 bad credential   4403 host/origin mismatch
     #       4408 peer not allowed  4404 chat disabled
-    auth_reason, cred = _ws_auth_reason(ws)
+    auth_reason, cred, auth_email = _ws_auth_reason(ws)
     mode = _ws_auth_mode()
     if auth_reason is not None:
         _log.warning(
@@ -10492,95 +10668,104 @@ async def pty_ws(ws: WebSocket) -> None:
     # --- spawn PTY ------------------------------------------------------
     resume = ws.query_params.get("resume") or None
     profile = ws.query_params.get("profile") or None
-    # RBAC: honor a request-scoped profile lock if one is active. NOTE: the
-    # chat WS authenticates via a minted ticket rather than the HTTP auth
-    # middleware, so for gated deployments the per-user pin must also be set
-    # during ticket validation (tracked as a remaining item) for full
-    # enforcement on the /chat tab.
+    # RBAC: the chat WS authenticates via a minted ticket rather than the HTTP
+    # auth middleware, so the per-user profile lock isn't set for us. Apply it
+    # here from the ticket's verified email (non-admin only) for the LIFETIME of
+    # the socket so the ``enforce`` below — and ``_resolve_profile_dir`` inside
+    # ``_resolve_chat_argv`` — pin a pinned user to their own profile and an
+    # admin / server-internal / loopback connection stays unrestricted.
     from hermes_cli.dashboard_auth.rbac_map import enforce as _rbac_enforce
-    profile = _rbac_enforce(profile)
-    channel = _channel_or_close_code(ws)
-    sidecar_url = _build_sidecar_url(channel) if channel else None
+    with _ws_rbac_lock(auth_email):
+        profile = _rbac_enforce(profile)
+        channel = _channel_or_close_code(ws)
+        # Namespace the sidecar channel by the locked profile so the PTY child's
+        # /api/pub frames and this tenant's /api/events subscriber share a key
+        # that another tenant can't reach. get_lock() is the active WS lock
+        # (None for admin/loopback → channel unchanged).
+        if channel:
+            from hermes_cli.dashboard_auth.rbac_map import get_lock as _get_lock
+            sidecar_url = _build_sidecar_url(_namespace_channel(channel, _get_lock()))
+        else:
+            sidecar_url = None
 
-    try:
-        argv, cwd, env = _resolve_chat_argv(
-            resume=resume, sidecar_url=sidecar_url, profile=profile
-        )
-    except HTTPException as exc:
-        # Unknown/invalid profile from _resolve_profile_dir.
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc.detail}\x1b[0m\r\n")
-        await ws.close(code=1011)
-        return
-    except SystemExit as exc:
-        # _make_tui_argv calls sys.exit(1) when node/npm is missing.
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
-        return
-
-
-    try:
-        bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
-    except PtyUnavailableError as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
-        return
-    except (FileNotFoundError, OSError) as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
-        return
-
-    loop = asyncio.get_running_loop()
-
-    # --- reader task: PTY master → WebSocket ----------------------------
-    async def pump_pty_to_ws() -> None:
-        while True:
-            chunk = await loop.run_in_executor(
-                None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
-            )
-            if chunk is None:  # EOF
-                return
-            if not chunk:  # no data this tick; yield control and retry
-                await asyncio.sleep(0)
-                continue
-            try:
-                await ws.send_bytes(chunk)
-            except Exception:
-                return
-
-    reader_task = asyncio.create_task(pump_pty_to_ws())
-
-    # --- writer loop: WebSocket → PTY master ----------------------------
-    try:
-        while True:
-            msg = await ws.receive()
-            msg_type = msg.get("type")
-            if msg_type == "websocket.disconnect":
-                break
-            raw = msg.get("bytes")
-            if raw is None:
-                text = msg.get("text")
-                raw = text.encode("utf-8") if isinstance(text, str) else b""
-            if not raw:
-                continue
-
-            # Resize escape is consumed locally, never written to the PTY.
-            match = _RESIZE_RE.match(raw)
-            if match and match.end() == len(raw):
-                cols = int(match.group(1))
-                rows = int(match.group(2))
-                bridge.resize(cols=cols, rows=rows)
-                continue
-
-            bridge.write(raw)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        reader_task.cancel()
         try:
-            await reader_task
-        except (asyncio.CancelledError, Exception):
+            argv, cwd, env = _resolve_chat_argv(
+                resume=resume, sidecar_url=sidecar_url, profile=profile
+            )
+        except HTTPException as exc:
+            # Unknown/invalid profile from _resolve_profile_dir.
+            await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc.detail}\x1b[0m\r\n")
+            await ws.close(code=1011)
+            return
+        except SystemExit as exc:
+            # _make_tui_argv calls sys.exit(1) when node/npm is missing.
+            await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+            await ws.close(code=1011)
+            return
+
+        try:
+            bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
+        except PtyUnavailableError as exc:
+            await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+            await ws.close(code=1011)
+            return
+        except (FileNotFoundError, OSError) as exc:
+            await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
+            await ws.close(code=1011)
+            return
+
+        loop = asyncio.get_running_loop()
+
+        # --- reader task: PTY master → WebSocket ----------------------------
+        async def pump_pty_to_ws() -> None:
+            while True:
+                chunk = await loop.run_in_executor(
+                    None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
+                )
+                if chunk is None:  # EOF
+                    return
+                if not chunk:  # no data this tick; yield control and retry
+                    await asyncio.sleep(0)
+                    continue
+                try:
+                    await ws.send_bytes(chunk)
+                except Exception:
+                    return
+
+        reader_task = asyncio.create_task(pump_pty_to_ws())
+
+        # --- writer loop: WebSocket → PTY master ----------------------------
+        try:
+            while True:
+                msg = await ws.receive()
+                msg_type = msg.get("type")
+                if msg_type == "websocket.disconnect":
+                    break
+                raw = msg.get("bytes")
+                if raw is None:
+                    text = msg.get("text")
+                    raw = text.encode("utf-8") if isinstance(text, str) else b""
+                if not raw:
+                    continue
+
+                # Resize escape is consumed locally, never written to the PTY.
+                match = _RESIZE_RE.match(raw)
+                if match and match.end() == len(raw):
+                    cols = int(match.group(1))
+                    rows = int(match.group(2))
+                    bridge.resize(cols=cols, rows=rows)
+                    continue
+
+                bridge.write(raw)
+        except WebSocketDisconnect:
             pass
-        bridge.close()
+        finally:
+            reader_task.cancel()
+            try:
+                await reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            bridge.close()
 
 
 # ---------------------------------------------------------------------------
@@ -10600,7 +10785,8 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    auth_reason, _cred, auth_email = _ws_auth_reason(ws)
+    if auth_reason is not None:
         await ws.close(code=4401)
         return
 
@@ -10610,7 +10796,11 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    # RBAC: pin a non-admin ticket owner to their own profile for the lifetime
+    # of the JSON-RPC socket so any profile-scoped dispatch confines to their
+    # tenant. Admin / server-internal / loopback stays unlocked.
+    with _ws_rbac_lock(auth_email):
+        await handle_ws(ws)
 
 
 # ---------------------------------------------------------------------------
@@ -10631,7 +10821,8 @@ async def pub_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    auth_reason, _cred, auth_email = _ws_auth_reason(ws)
+    if auth_reason is not None:
         await ws.close(code=4401)
         return
 
@@ -10646,11 +10837,18 @@ async def pub_ws(ws: WebSocket) -> None:
 
     await ws.accept()
 
-    try:
-        while True:
-            await _broadcast_event(ws.app, channel, await ws.receive_text())
-    except WebSocketDisconnect:
-        pass
+    # RBAC: namespace the publish channel by the authenticated profile so a
+    # non-admin can only publish into their own tenant's channels — a peer on
+    # another tenant subscribing to the same raw channel id can't see these
+    # frames. Admin / server-internal / loopback (no lock) is unchanged.
+    with _ws_rbac_lock(auth_email):
+        from hermes_cli.dashboard_auth.rbac_map import get_lock as _get_lock
+        eff_channel = _namespace_channel(channel, _get_lock())
+        try:
+            while True:
+                await _broadcast_event(ws.app, eff_channel, await ws.receive_text())
+        except WebSocketDisconnect:
+            pass
 
 
 @app.websocket("/api/events")
@@ -10659,7 +10857,8 @@ async def events_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    auth_reason, _cred, auth_email = _ws_auth_reason(ws)
+    if auth_reason is not None:
         await ws.close(code=4401)
         return
 
@@ -10674,27 +10873,35 @@ async def events_ws(ws: WebSocket) -> None:
 
     await ws.accept()
 
-    event_channels, event_lock = _get_event_state(ws.app)
-    async with event_lock:
-        event_channels.setdefault(channel, set()).add(ws)
+    # RBAC: subscribe under the profile-namespaced channel so a non-admin only
+    # receives frames published within their own tenant (matches the namespace
+    # the PTY child's /api/pub and pub_ws apply). Admin / loopback (no lock)
+    # subscribe on the raw channel exactly as before.
+    with _ws_rbac_lock(auth_email):
+        from hermes_cli.dashboard_auth.rbac_map import get_lock as _get_lock
+        eff_channel = _namespace_channel(channel, _get_lock())
 
-    try:
-        while True:
-            # Subscribers don't speak — the receive() just blocks until
-            # disconnect so the connection stays open as long as the
-            # browser holds it.
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        pass
-    finally:
+        event_channels, event_lock = _get_event_state(ws.app)
         async with event_lock:
-            subs = event_channels.get(channel)
+            event_channels.setdefault(eff_channel, set()).add(ws)
 
-            if subs is not None:
-                subs.discard(ws)
+        try:
+            while True:
+                # Subscribers don't speak — the receive() just blocks until
+                # disconnect so the connection stays open as long as the
+                # browser holds it.
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            async with event_lock:
+                subs = event_channels.get(eff_channel)
 
-                if not subs:
-                    event_channels.pop(channel, None)
+                if subs is not None:
+                    subs.discard(ws)
+
+                    if not subs:
+                        event_channels.pop(eff_channel, None)
 
 
 def _normalise_prefix(raw: Optional[str]) -> str:

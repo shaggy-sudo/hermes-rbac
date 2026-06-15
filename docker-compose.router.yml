@@ -33,7 +33,10 @@ services:
     environment:
       - PYTHONPATH=/opt/hermes
       - ROUTER_PUBLIC_URL=${HERMES_DASHBOARD_PUBLIC_URL:-}
-      - ROUTER_SECRET=${ROUTER_SECRET:-change-me-please}
+      # Fail closed: the router refuses to start without a high-entropy secret
+      # (>=32 chars). Generate one with `openssl rand -hex 32`. A forgeable
+      # default would let anyone mint a session cookie for any email.
+      - ROUTER_SECRET=${ROUTER_SECRET:?set ROUTER_SECRET to a high-entropy random value, e.g. openssl rand -hex 32}
       - HERMES_IMAGE=hermes-agent
       - HERMES_NET=hermes-rbac-net
       # HOST path of ~/.hermes — docker -v sources resolve on the host, so the

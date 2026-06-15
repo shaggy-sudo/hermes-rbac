@@ -567,3 +567,36 @@ class TestGatewayWsUrl:
             assert web_server._build_gateway_ws_url() is None
         finally:
             web_server.app.state.bound_host = "fly-app.fly.dev"
+
+
+class TestWsTicketEmailPropagation:
+    """A browser ticket carries the verified email out of _ws_auth_reason so
+    the WS handlers can apply the per-user RBAC lock; internal/loopback don't."""
+
+    def test_ticket_email_propagated(self, gated_app):
+        ticket = mint_ticket(user_id="u1", provider="stub", email="user@acme.com")
+        ws = _fake_ws(query={"ticket": ticket})
+        reason, cred, email = web_server._ws_auth_reason(ws)
+        assert reason is None
+        assert cred == "ticket"
+        assert email == "user@acme.com"
+
+    def test_internal_credential_carries_no_email(self, gated_app):
+        ws = _fake_ws(query={"internal": internal_ws_credential()})
+        reason, cred, email = web_server._ws_auth_reason(ws)
+        assert reason is None
+        assert cred == "internal"
+        # Server-internal: no user, so no RBAC lock downstream.
+        assert email is None
+
+    def test_loopback_token_carries_no_email(self, loopback_app):
+        ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
+        reason, cred, email = web_server._ws_auth_reason(ws)
+        assert reason is None
+        assert cred == "token"
+        assert email is None
+
+    def test_namespace_channel_confines_by_profile(self):
+        # Locked: prefixed by the profile. Unlocked: passes through.
+        assert web_server._namespace_channel("ch-1", "u-tenant") == "u-tenant~ch-1"
+        assert web_server._namespace_channel("ch-1", None) == "ch-1"

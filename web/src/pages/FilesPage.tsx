@@ -12,9 +12,11 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  Lock,
   RefreshCw,
   Trash2,
   Upload,
+  Users,
 } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
@@ -83,6 +85,20 @@ function displayPath(path: string | null | undefined): string {
   return path?.trim() || "Files";
 }
 
+/**
+ * The container mounts the user's private profile at /opt/data and the
+ * role-shared space at /shared. The client can't see mount metadata, so the
+ * only reliable signal it has is the path prefix: anything under /shared is
+ * the role-shared team space (read-only for the SPA), everything else is the
+ * user's private space.
+ */
+const SHARED_ROOT_PREFIX = "/shared";
+
+function isSharedPath(path: string | null | undefined): boolean {
+  const p = (path ?? "").trim();
+  return p === SHARED_ROOT_PREFIX || p.startsWith(`${SHARED_ROOT_PREFIX}/`);
+}
+
 function transferHasFiles(event: ReactDragEvent<HTMLElement>): boolean {
   return Array.from(event.dataTransfer.types).includes("Files");
 }
@@ -107,7 +123,10 @@ export default function FilesPage() {
 
   const activePath = listing?.path ?? currentPath ?? "";
   const canChangePath = listing?.can_change_path ?? false;
-  const canUpload = Boolean(activePath) && !uploading;
+  // Files under /shared are the role-shared team space; surface them as
+  // read-only so users don't expect to mutate the shared bundle from here.
+  const sharedView = isSharedPath(activePath);
+  const canUpload = Boolean(activePath) && !uploading && !sharedView;
   const headerPath = displayPath(listing?.locked_root ?? listing?.path ?? currentPath);
 
   const load = useCallback(
@@ -137,9 +156,30 @@ export default function FilesPage() {
 
   useEffect(() => {
     setAfterTitle(
-      <Badge tone="outline" className="max-w-[22rem] truncate text-xs" title={headerPath}>
-        {headerPath}
-      </Badge>,
+      <span className="flex min-w-0 items-center gap-2">
+        {sharedView ? (
+          <Badge
+            tone="warning"
+            className="shrink-0 gap-1 text-xs uppercase tracking-[0.08em]"
+            title="Role-shared team space (read-only here)"
+          >
+            <Users className="h-3 w-3" />
+            Shared
+          </Badge>
+        ) : (
+          <Badge
+            tone="outline"
+            className="shrink-0 gap-1 text-xs uppercase tracking-[0.08em]"
+            title="Your private space"
+          >
+            <Lock className="h-3 w-3" />
+            Private
+          </Badge>
+        )}
+        <Badge tone="outline" className="max-w-[22rem] truncate text-xs" title={headerPath}>
+          {headerPath}
+        </Badge>
+      </span>,
     );
     setEnd(
       <div className="flex items-center gap-2">
@@ -159,7 +199,7 @@ export default function FilesPage() {
       setAfterTitle(null);
       setEnd(null);
     };
-  }, [headerPath, load, loading, setAfterTitle, setEnd]);
+  }, [headerPath, load, loading, sharedView, setAfterTitle, setEnd]);
 
   const openDirectory = (entry: ManagedFileEntry) => {
     if (entry.is_directory) {
@@ -325,7 +365,7 @@ export default function FilesPage() {
           <Button
             type="button"
             onClick={() => setCreateDialogOpen(true)}
-            disabled={!activePath}
+            disabled={!activePath || sharedView}
             size="sm"
             outlined
             className="uppercase"
@@ -371,6 +411,15 @@ export default function FilesPage() {
 
       <Card className="min-w-0 max-w-full overflow-hidden">
         <CardContent className="overflow-x-auto p-0">
+          {sharedView && (
+            <div className="flex items-center gap-2 border-b border-warning/20 bg-warning/10 p-3 text-xs text-warning">
+              <Lock className="h-3.5 w-3.5 shrink-0" />
+              <span>
+                This is your role's shared team space. Files here are read-only
+                from the dashboard — uploads and changes are disabled.
+              </span>
+            </div>
+          )}
           {error && (
             <div className="border-b border-destructive/20 bg-destructive/10 p-3 text-sm text-destructive">
               {error}

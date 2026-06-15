@@ -571,10 +571,45 @@ async def auth_logout(request: Request):
 
 @router.get("/api/auth/me", name="auth_me")
 async def api_auth_me(request: Request):
-    """Return the verified session as JSON. Auth-required (gate enforces)."""
+    """Return the verified session as JSON. Auth-required (gate enforces).
+
+    Per-user-container model: the dashboard runs ``--insecure`` with no
+    in-container session, but the trusted router spawns the container with the
+    Google-verified identity in ``HERMES_RBAC_USER_*`` env (only the router can
+    set container env). When there's no session, fall back to that vouch so the
+    SPA can still show the user their identity/role and filter the nav. Pure
+    loopback dev (no router, no env) keeps the 401 → single-operator mode.
+    """
+    import os as _os
+
+    from hermes_cli.dashboard_auth import rbac_map
+
     sess = getattr(request.state, "session", None)
     if sess is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        vouched_email = (_os.environ.get("HERMES_RBAC_USER_EMAIL", "") or "").strip()
+        if not vouched_email:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        role = (_os.environ.get("HERMES_RBAC_USER_ROLE", "") or "").strip() \
+            or rbac_map.role_for_email(vouched_email)
+        is_admin = (_os.environ.get("HERMES_RBAC_IS_ADMIN", "") or "").strip() == "1" \
+            or rbac_map.is_admin(vouched_email)
+        return {
+            "user_id": vouched_email,
+            "email": vouched_email,
+            "display_name": vouched_email.split("@", 1)[0],
+            "org_id": None,
+            "provider": "google",
+            "expires_at": None,
+            "role": role,
+            "is_admin": is_admin,
+            "shared_volume": role,
+        }
+    # Surface the caller's RBAC role so the SPA can show "you are a <role>".
+    # Purely additive — the existing fields are unchanged. ``role`` keys off the
+    # verified email (admin allowlist > role-overrides.json > default); the
+    # shared-volume name is the role's shared-skills bundle id.
+    email = sess.email or ""
+    role = rbac_map.role_for_email(email)
     return {
         "user_id": sess.user_id,
         "email": sess.email,
@@ -582,6 +617,9 @@ async def api_auth_me(request: Request):
         "org_id": sess.org_id,
         "provider": sess.provider,
         "expires_at": sess.expires_at,
+        "role": role,
+        "is_admin": rbac_map.is_admin(email),
+        "shared_volume": role,
     }
 
 
@@ -611,7 +649,9 @@ async def api_auth_ws_ticket(request: Request):
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    ticket = mint_ticket(
+        user_id=sess.user_id, provider=sess.provider, email=sess.email
+    )
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
         provider=sess.provider,

@@ -14,7 +14,7 @@ roles:
     toolsets: [hermes-cli]
     backend: docker
     shared_skills: [common]
-    description: "Full access. Manages other roles, infra, and deployments."
+    description: "Full per-container toolset (terminal/file/cron) inside the user's own isolated container. Infra/console admin (machine-level profile switcher, /rbac console, full data mount) is granted separately via the HERMES_ADMIN_EMAILS allowlist."
 
   developer:
     toolsets: [terminal, file, web, vision, skills, todo, cronjob]

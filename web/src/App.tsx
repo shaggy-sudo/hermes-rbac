@@ -63,6 +63,7 @@ import { SidebarStatusStrip, gatewayLine } from "@/components/SidebarStatusStrip
 import { useBelowBreakpoint } from "@nous-research/ui/hooks/use-below-breakpoint";
 import { useSidebarStatus } from "@/hooks/useSidebarStatus";
 import { AuthWidget } from "@/components/AuthWidget";
+import { useAuthMe } from "@/hooks/useAuthMe";
 import { PageHeaderProvider } from "@/contexts/PageHeaderProvider";
 import { ProfileProvider } from "@/contexts/ProfileProvider";
 import { useProfileScope } from "@/contexts/useProfileScope";
@@ -197,6 +198,23 @@ const BUILTIN_NAV_REST: NavItem[] = [
     icon: BookOpen,
   },
 ];
+
+/**
+ * Built-in nav paths a NON-admin RBAC user may see. The machine-administration
+ * pages (Profiles, Config, Keys, Env, System, Plugins, MCP, Channels, Webhooks,
+ * Pairing, Models, Cron, Logs, Analytics) are admin-only and filtered out for
+ * everyone else. Admins keep the full nav. Plugin tabs are unaffected.
+ */
+const USER_VISIBLE_NAV_PATHS = new Set<string>([
+  "/chat",
+  "/sessions",
+  "/files",
+  "/skills",
+  "/docs",
+]);
+
+/** External server-rendered RBAC admin console (not a SPA route). */
+const RBAC_ADMIN_HREF = "/rbac";
 
 const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
   Activity,
@@ -424,14 +442,28 @@ export default function App() {
     [embeddedChat],
   );
 
+  // RBAC identity from the auth gate. Drives nav filtering: non-admins see
+  // only user-relevant pages, admins keep the full machine-administration nav.
+  // Mirrors how ProfileSwitcher self-hides for non-applicable surfaces.
+  const { me: authMe, hidden: authHidden } = useAuthMe();
+  // Treat the user as admin when the gate isn't engaged (loopback / --insecure
+  // mode 401s and surfaces as `hidden`): that path is the single-operator
+  // machine dashboard, which must keep the full nav. In gated mode, restrict
+  // until we know the role, then honor is_admin.
+  const isAdmin = authHidden || authMe?.is_admin === true;
+
   const builtinNav = useMemo(() => {
     const base = embeddedChat
       ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
       : BUILTIN_NAV_REST;
-    return showTokenAnalytics
+    const analyticsFiltered = showTokenAnalytics
       ? base
       : base.filter((n) => n.path !== "/analytics");
-  }, [embeddedChat, showTokenAnalytics]);
+    if (isAdmin) return analyticsFiltered;
+    // Non-admin, or still resolving the gate identity: render only the safe
+    // minimal user set so we never flash admin pages to a non-admin.
+    return analyticsFiltered.filter((n) => USER_VISIBLE_NAV_PATHS.has(n.path));
+  }, [embeddedChat, showTokenAnalytics, isAdmin]);
 
   const sidebarNav = useMemo(
     () => partitionSidebarNav(builtinNav, manifests),
@@ -625,6 +657,16 @@ export default function App() {
                     tooltipWarmRef={tooltipWarmRef}
                   />
                 ))}
+                {isAdmin && authMe?.is_admin === true && (
+                  <SidebarExternalLink
+                    collapsed={isDesktopCollapsed}
+                    href={RBAC_ADMIN_HREF}
+                    icon={Shield}
+                    label="Shared Management"
+                    onNavigate={closeMobile}
+                    tooltipWarmRef={tooltipWarmRef}
+                  />
+                )}
               </ul>
 
               {sidebarNav.pluginItems.length > 0 && (
@@ -879,6 +921,67 @@ function SidebarNavLink({
 
       {collapsed && hovered && liRef.current && (
         <SidebarTooltip anchor={liRef.current} label={navLabel} warmRef={tooltipWarmRef} />
+      )}
+    </li>
+  );
+}
+
+/**
+ * Sidebar link to an external, server-rendered route (e.g. the RBAC admin
+ * console at /rbac). Unlike SidebarNavLink this is a plain anchor — the target
+ * isn't a SPA route, so it triggers a full-page navigation. Visual treatment
+ * mirrors SidebarNavLink for consistency.
+ */
+function SidebarExternalLink({
+  collapsed,
+  href,
+  icon: Icon,
+  label,
+  onNavigate,
+  tooltipWarmRef,
+}: SidebarExternalLinkProps) {
+  const liRef = useRef<HTMLLIElement>(null);
+  const [hovered, setHovered] = useState(false);
+
+  return (
+    <li
+      ref={liRef}
+      onMouseEnter={collapsed ? () => setHovered(true) : undefined}
+      onMouseLeave={collapsed ? () => setHovered(false) : undefined}
+    >
+      <a
+        href={href}
+        onClick={onNavigate}
+        aria-label={collapsed ? label : undefined}
+        onFocus={collapsed ? () => setHovered(true) : undefined}
+        onBlur={collapsed ? () => setHovered(false) : undefined}
+        className={cn(
+          "group/nav relative flex items-center gap-3",
+          "px-5 py-2.5",
+          "font-mondwest text-display uppercase text-sm tracking-[0.12em]",
+          "whitespace-nowrap transition-colors cursor-pointer",
+          "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-midground",
+          "text-text-secondary hover:text-midground",
+        )}
+        style={{ clipPath: "var(--component-tab-clip-path)" }}
+      >
+        <Icon className="h-3.5 w-3.5 shrink-0" />
+        <span
+          className={cn(
+            "truncate transition-opacity duration-300",
+            collapsed ? "lg:opacity-0" : "lg:opacity-100",
+          )}
+        >
+          {label}
+        </span>
+        <span
+          aria-hidden
+          className="absolute inset-y-0.5 left-1.5 right-1.5 bg-midground opacity-0 pointer-events-none transition-opacity duration-200 group-hover/nav:opacity-5"
+        />
+      </a>
+
+      {collapsed && hovered && liRef.current && (
+        <SidebarTooltip anchor={liRef.current} label={label} warmRef={tooltipWarmRef} />
       )}
     </li>
   );
@@ -1192,6 +1295,15 @@ interface SidebarNavLinkProps {
   collapsed: boolean;
   item: NavItem;
   t: Translations;
+  tooltipWarmRef: TooltipWarmRef;
+}
+
+interface SidebarExternalLinkProps {
+  collapsed: boolean;
+  href: string;
+  icon: ComponentType<{ className?: string }>;
+  label: string;
+  onNavigate: () => void;
   tooltipWarmRef: TooltipWarmRef;
 }
 

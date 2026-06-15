@@ -83,7 +83,17 @@ def test_admin_gate():
     assert nonadmin.get("/api/rbac/roles").status_code == 403
 
     # Admin -> 200 and sees the seeded roles + can flow through writes.
-    admin = TestClient(_app_with_session("boss@acme.com"))
+    # Mutating routes require the CSRF header (X-Requested-With: fetch); the
+    # admin client sends it by default so every write below carries it.
+    admin = TestClient(_app_with_session("boss@acme.com"),
+                       headers={"X-Requested-With": "fetch"})
+
+    # A mutating request WITHOUT the CSRF header is refused (403), even for an
+    # authenticated admin.
+    no_csrf = TestClient(_app_with_session("boss@acme.com"))
+    assert no_csrf.post("/api/rbac/assign-role",
+                        json={"email": "dev@acme.com", "role": "developer"}).status_code == 403
+
     r = admin.get("/api/rbac/roles")
     assert r.status_code == 200, r.text
     names = {x["name"] for x in r.json()["roles"]}

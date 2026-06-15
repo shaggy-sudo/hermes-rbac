@@ -86,6 +86,45 @@ function withManagementProfile(url: string): string {
   return `${url}${sep}profile=${encodeURIComponent(_managementProfile)}`;
 }
 
+/**
+ * Build a user-friendly error message from a non-2xx response.
+ *
+ * The backend returns errors as ``{"detail": "..."}`` (FastAPI) or a bare
+ * body; surfacing the raw ``"<status>: {\"detail\":...}"`` string in a toast
+ * is hostile. Parse the structured detail when present and map the common
+ * status classes to generic, reassuring copy. The status code is kept as a
+ * prefix on auth statuses (401/403) because callers like AuthWidget key off
+ * ``msg.startsWith("401:")`` to decide whether the gate is engaged.
+ */
+async function friendlyError(res: Response): Promise<string> {
+  let detail: string | null = null;
+  const text = await res.text().catch(() => "");
+  if (text) {
+    try {
+      const body = JSON.parse(text) as { detail?: unknown };
+      if (typeof body.detail === "string" && body.detail.trim()) {
+        detail = body.detail.trim();
+      }
+    } catch {
+      // Non-JSON body — fall back to the raw text below.
+    }
+    if (detail === null && text.trim() && !text.trim().startsWith("{")) {
+      detail = text.trim();
+    }
+  }
+
+  if (res.status === 403) {
+    return `403: ${detail ?? "You don't have access to this"}`;
+  }
+  if (res.status === 401) {
+    return `401: ${detail ?? "Your session is no longer valid"}`;
+  }
+  if (res.status >= 500) {
+    return "Something went wrong, please try again";
+  }
+  return detail ?? res.statusText ?? `Request failed (${res.status})`;
+}
+
 export async function fetchJSON<T>(
   url: string,
   init?: RequestInit,
@@ -180,8 +219,7 @@ export async function fetchJSON<T>(
     }
   }
   if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(`${res.status}: ${text}`);
+    throw new Error(await friendlyError(res));
   }
   return res.json();
 }
@@ -1147,10 +1185,14 @@ export const api = {
 /** Identity payload returned by ``GET /api/auth/me`` (Phase 7).
  *
  * Returned by the dashboard's gated middleware when a valid session cookie
- * is attached. ``email`` and ``display_name`` are empty strings under the
- * Nous Portal contract V1 (the access token has no email/name claims —
- * see Contract Anchor C4 in the plan). The AuthWidget surfaces a
- * truncated ``user_id`` instead.
+ * is attached. The Google provider populates ``email`` and ``display_name``;
+ * other providers may leave them empty, in which case consumers fall back to
+ * the ``user_id``.
+ *
+ * The RBAC fields (``role``/``is_admin``/``shared_volume``) are emitted by
+ * the per-user-container gate so the SPA can show the caller their role and
+ * gate admin-only navigation. They are optional for forward/backward compat
+ * with deployments whose ``/api/auth/me`` predates them.
  */
 export interface AuthMeResponse {
   user_id: string;
@@ -1159,6 +1201,12 @@ export interface AuthMeResponse {
   org_id: string;
   provider: string;
   expires_at: number;
+  /** The caller's RBAC role (e.g. "viewer" | "developer" | "admin"). */
+  role?: string;
+  /** True only for infra/console admins (HERMES_ADMIN_EMAILS allowlist). */
+  is_admin?: boolean;
+  /** The role's shared volume name (equals ``role``). */
+  shared_volume?: string;
 }
 
 export interface ActionResponse {

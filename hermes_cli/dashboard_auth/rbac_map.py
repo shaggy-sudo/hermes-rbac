@@ -199,6 +199,36 @@ def ensure_user_profile(email: str) -> None:
         )
 
 
+def lock_tokens_for_email(email: str):
+    """Apply the per-user RBAC lock for ``email`` and return reset tokens.
+
+    Shared by the HTTP middleware (``_apply_rbac_lock``) and the WebSocket
+    handlers so the lock-application logic lives in one place and can't drift.
+    Admins (and empty emails) are left UNLOCKED — they keep the machine-level
+    profile switcher and unrestricted behavior. Everyone else is pinned to their
+    own derived profile + their role's shared roots. Returns an opaque tokens
+    object to hand back to :func:`release_lock_tokens`.
+
+    First use provisions the user's profile (private FS + role shared FS),
+    mirroring the HTTP path so a WS-first session still works.
+    """
+    e = (email or "").strip()
+    if not e or is_admin(e):
+        return (set_lock(None), set_shared_roots(()))
+    ensure_user_profile(e)
+    role = role_for_email(e)
+    lock_tok = set_lock(profile_for_email(e))
+    shared_tok = set_shared_roots(shared_dirs_for_role(role))
+    return (lock_tok, shared_tok)
+
+
+def release_lock_tokens(tokens) -> None:
+    """Reset the lock + shared-roots context set by :func:`lock_tokens_for_email`."""
+    lock_tok, shared_tok = tokens
+    reset_lock(lock_tok)
+    reset_shared_roots(shared_tok)
+
+
 def enforce(requested: Optional[str]) -> Optional[str]:
     """Resolution chokepoint helper. When a lock is active, the requested
     profile is overridden with the locked one (a pinned user cannot escape

@@ -59,17 +59,23 @@ class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
 
-def mint_ticket(*, user_id: str, provider: str) -> str:
+def mint_ticket(*, user_id: str, provider: str, email: Optional[str] = None) -> str:
     """Generate a one-shot ticket bound to this user identity.
 
     The returned token is base64url, 43 bytes of entropy (32-byte random
     seed). Stash returns the ``info`` dict to the caller on consume so the
     WS handler can carry the identity forward into its session log.
+
+    ``email`` is the verified session email; it is stored in the ticket so the
+    consuming WS handler can apply the per-user RBAC lock (browser WS upgrades
+    can't carry the session cookie through to the handler the way HTTP requests
+    do). ``None`` for credential paths that aren't a real browser user.
     """
     ticket = secrets.token_urlsafe(32)
     info = {
         "user_id": user_id,
         "provider": provider,
+        "email": email,
         "minted_at": int(time.time()),
     }
     with _lock:
@@ -150,6 +156,9 @@ def consume_internal_credential(value: str) -> Dict[str, Any]:
     return {
         "user_id": INTERNAL_USER_ID,
         "provider": INTERNAL_PROVIDER,
+        # Server-internal (server-spawned child): no real user, so no RBAC lock
+        # is applied downstream — these calls stay unrestricted, as before.
+        "email": None,
     }
 
 
