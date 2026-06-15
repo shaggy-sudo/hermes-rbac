@@ -363,7 +363,12 @@ async def callback(request: Request):
     resp = RedirectResponse("/", status_code=302)
     resp.set_cookie(
         COOKIE, _issue_cookie(session.email),
-        httponly=True, secure=IS_HTTPS, samesite="strict", max_age=86400,
+        # SameSite=Lax (not Strict): the post-OAuth landing on "/" is the tail
+        # of a cross-site redirect chain from accounts.google.com, and Strict
+        # withholds the cookie on that navigation → the dashboard bounces back
+        # to /login forever. Lax sends it on top-level navigations (the login
+        # landing) while still blocking cross-site subresource/POST CSRF.
+        httponly=True, secure=IS_HTTPS, samesite="lax", max_age=86400,
     )
     resp.delete_cookie(PKCE_COOKIE, path="/auth")
     return resp
