@@ -28,6 +28,8 @@ Env:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -143,6 +145,15 @@ def _read_cookie(request: Request) -> str | None:
 # Per-user container lifecycle (docker CLI over the mounted socket)
 # ---------------------------------------------------------------------------
 
+def _session_token_for(email: str) -> str:
+    """Stable per-user dashboard session token (the --insecure SPA token).
+
+    Derived from ROUTER_SECRET so it survives container respawns/restarts —
+    keeping already-open browser tabs authenticated — yet stays unguessable
+    without the secret."""
+    return hmac.new(SECRET.encode(), email.encode(), hashlib.sha256).hexdigest()
+
+
 def _slug(email: str) -> str:
     return rbac_map.profile_for_email(email)  # u-<slug>, validated
 
@@ -226,6 +237,12 @@ def ensure_container(email: str) -> str:
         "-e", f"HERMES_RBAC_USER_EMAIL={email}",
         "-e", f"HERMES_RBAC_USER_ROLE={role}",
         "-e", f"HERMES_RBAC_IS_ADMIN={'1' if admin else '0'}",
+        # Pin the dashboard's --insecure session token to a value that is
+        # STABLE across container respawns (derived from ROUTER_SECRET + email,
+        # unguessable without the secret). Otherwise every respawn/restart mints
+        # a fresh random token and the user's already-open SPA tab keeps sending
+        # the old one → /api/* 401 → infinite spinners until a hard refresh.
+        "-e", f"HERMES_DASHBOARD_SESSION_TOKEN={_session_token_for(email)}",
     ]
 
     admin_env: list[str] = []
