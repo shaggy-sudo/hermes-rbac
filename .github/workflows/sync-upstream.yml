@@ -1,0 +1,55 @@
+name: Sync upstream
+
+# Keeps this fork up to date with NousResearch/hermes-agent without clobbering
+# the RBAC layer on main. Runs weekly and on demand. It does NOT push to main
+# directly — it refreshes an `upstream-sync` branch (= upstream/main) and opens
+# a PR into main, so any conflicts with the RBAC changes are reviewed and
+# resolved in the PR instead of silently breaking main.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # every Monday 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+
+      - name: Refresh upstream-sync branch
+        run: |
+          # Branch points at the current upstream main. Force so it always
+          # tracks the latest upstream tip.
+          git push origin "upstream/main:refs/heads/upstream-sync" --force
+
+      - name: Open or update sync PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Skip if upstream-sync is already an ancestor of main (nothing new).
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "main already contains upstream/main — nothing to sync."
+            exit 0
+          fi
+          if gh pr list --head upstream-sync --base main --state open \
+               --json number --jq 'length' | grep -q '^0$'; then
+            gh pr create --base main --head upstream-sync \
+              --title "Sync upstream Hermes Agent" \
+              --body "Automated: merge the latest \`NousResearch/hermes-agent\` \`main\` into this fork's \`main\`. Resolve any conflicts with the RBAC layer (mostly \`hermes_cli/web_server.py\`, \`hermes_cli/dashboard_auth/middleware.py\`) here before merging."
+          else
+            echo "Sync PR already open — branch refreshed."
+          fi
