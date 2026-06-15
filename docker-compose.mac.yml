@@ -1,0 +1,60 @@
+#
+# docker-compose.mac.yml — Mac / Docker Desktop friendly override.
+#
+# The upstream docker-compose.yml uses `network_mode: host`, which does not
+# work on Docker Desktop for macOS (host networking is Linux-only / beta).
+# This override drops host networking and instead publishes the dashboard's
+# web UI on the host loopback only.
+#
+# Usage:
+#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) \
+#     docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+#
+# Accessing the dashboard (web UI):
+#   - OrbStack (detected on this machine): use the auto-assigned domain
+#       http://hermes-dashboard.orb.local:9119
+#     OrbStack routes container IPs/domains straight to the host, so the
+#     127.0.0.1:9119 published mapping below is unreliable there (connection
+#     reset) and not needed. The orb.local domain is the stable URL.
+#   - Docker Desktop: use http://127.0.0.1:9119 (the published mapping).
+#
+# Either way the dashboard is reachable only from this host, not the LAN.
+# It stores API keys — keep it local; see the --insecure note below.
+#
+services:
+  gateway:
+    # Outbound-only (Telegram/Discord/Slack long-poll + LLM API). No published
+    # ports needed unless you enable webhook-based adapters.
+    network_mode: "bridge"
+
+  dashboard:
+    network_mode: "bridge"
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      # --- Google auth gate (RBAC) ---
+      # Set these in .env to engage Google login in front of the web UI, then
+      # switch `command` below from the --insecure line to the gated line.
+      # Create an OAuth 2.0 *Web application* client in Google Cloud Console and
+      # register <dashboard-base-url>/auth/callback as an Authorized redirect URI.
+      # NOTE: Google requires the redirect URI to be HTTPS unless the host is
+      # localhost/127.0.0.1 — use the OrbStack HTTPS domain or an SSH tunnel to
+      # localhost for the live flow (see rbac/AUTH.md).
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - GOOGLE_ALLOWED_DOMAIN=${GOOGLE_ALLOWED_DOMAIN:-}
+      - GOOGLE_ALLOWED_EMAILS=${GOOGLE_ALLOWED_EMAILS:-}
+      # Comma-separated admin emails — these users are NOT pinned to one
+      # profile (they keep the machine-level profile switcher).
+      - HERMES_ADMIN_EMAILS=${HERMES_ADMIN_EMAILS:-}
+      # Default role for newly-provisioned (non-admin) users.
+      - HERMES_DEFAULT_ROLE=${HERMES_DEFAULT_ROLE:-viewer}
+      # Force the public base URL for the OAuth callback (set to the ngrok
+      # tunnel URL). Needed because the browser reaches the dashboard via the
+      # tunnel hostname, not the container's.
+      - HERMES_DASHBOARD_PUBLIC_URL=${HERMES_DASHBOARD_PUBLIC_URL:-}
+    # MODE 1 (no auth): - command: ["dashboard", "--host", "0.0.0.0", "--no-open", "--insecure"]
+    # MODE 2 (Google gate, ACTIVE): requires Google login before the web UI.
+    command: ["dashboard", "--host", "0.0.0.0", "--no-open"]
+    ports:
+      - "127.0.0.1:9119:9119"

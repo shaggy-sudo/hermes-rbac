@@ -1,0 +1,51 @@
+#
+# docker-compose.router.yml — per-user-container model.
+#
+# The router is the public front door (Google gate). It spawns one dashboard
+# container per authenticated user, mounting ONLY that user's profile (as
+# /opt/data) + their role's /shared, and reverse-proxies to it. docker.sock is
+# mounted into the ROUTER only (the trusted orchestrator) — never into a
+# container where a user gets a PTY.
+#
+# Usage (point ngrok/tunnel at 127.0.0.1:9200 -> the router):
+#   docker compose -f docker-compose.yml -f docker-compose.router.yml up -d router
+#
+networks:
+  hermes-rbac-net:
+    name: hermes-rbac-net
+    external: true
+
+services:
+  router:
+    image: hermes-agent
+    container_name: hermes-router
+    restart: unless-stopped
+    networks:
+      - hermes-rbac-net
+    # Bypass s6; run the router ASGI app directly.
+    entrypoint: ["/opt/hermes/.venv/bin/python", "-m", "uvicorn"]
+    command: ["router:app", "--host", "0.0.0.0", "--port", "9200", "--app-dir", "/opt/hermes/rbac/router", "--ws", "websockets"]
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      # Trusted orchestrator: needs docker to spawn per-user containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - PYTHONPATH=/opt/hermes
+      - ROUTER_PUBLIC_URL=${HERMES_DASHBOARD_PUBLIC_URL:-}
+      - ROUTER_SECRET=${ROUTER_SECRET:-change-me-please}
+      - HERMES_IMAGE=hermes-agent
+      - HERMES_NET=hermes-rbac-net
+      # HOST path of ~/.hermes — docker -v sources resolve on the host, so the
+      # router must mount per-user profiles by their host path, not /opt/data.
+      - HERMES_HOST_DATA=${HERMES_HOST_DATA:?set HERMES_HOST_DATA to the host path of ~/.hermes}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - GOOGLE_ALLOWED_DOMAIN=${GOOGLE_ALLOWED_DOMAIN:-}
+      - GOOGLE_ALLOWED_EMAILS=${GOOGLE_ALLOWED_EMAILS:-}
+      - HERMES_ADMIN_EMAILS=${HERMES_ADMIN_EMAILS:-}
+      - HERMES_DEFAULT_ROLE=${HERMES_DEFAULT_ROLE:-viewer}
+      # Forwarded into each per-user profile (seeded by provisioning) so the
+      # user's agent can actually call the LLM.
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - HERMES_DEFAULT_MODEL=${HERMES_DEFAULT_MODEL:-openrouter/owl-alpha}

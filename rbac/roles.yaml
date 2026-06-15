@@ -1,0 +1,29 @@
+# RBAC role definitions — source of truth for init-role.sh.
+# Each role becomes a Hermes profile with isolated memory, skills, and venv.
+#
+# toolsets:      which tool groups the role may use (maps to platform_toolsets).
+#                Drop `terminal` to make a role effectively read-only.
+# backend:       terminal execution backend. Use `docker` to truly isolate the
+#                role's venv/filesystem; `local` shares the host (no enforcement).
+# shared_skills: read-only skill bundles from rbac/shared-skills/<name> mounted
+#                via skills.external_dirs (in addition to the profile's own skills/).
+# description:   used by the kanban orchestrator for routing (optional).
+
+roles:
+  admin:
+    toolsets: [hermes-cli]
+    backend: docker
+    shared_skills: [common]
+    description: "Full access. Manages other roles, infra, and deployments."
+
+  developer:
+    toolsets: [terminal, file, web, vision, skills, todo, cronjob]
+    backend: docker
+    shared_skills: [common, coding]
+    description: "Writes and runs code in an isolated container. No admin tools."
+
+  viewer:
+    toolsets: [web, vision, skills, todo]
+    backend: docker
+    shared_skills: [common]
+    description: "Read-only research. No terminal, no file writes, no shell."

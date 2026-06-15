@@ -173,6 +173,9 @@ def _get_event_state(app: "FastAPI"):
 
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
+# Shared Management admin surface (/rbac + /api/rbac/*) — admin-gated inside.
+from hermes_cli.dashboard_auth.rbac_admin import register_rbac_admin
+register_rbac_admin(app)
 
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
@@ -1032,9 +1035,25 @@ def _fs_path(raw_path: str) -> Path:
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = Path.cwd() / candidate
-        return candidate.resolve(strict=False)
+        resolved = candidate.resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid path")
+    # RBAC: confine a pinned (non-admin) user's file browser to their own
+    # profile home + their role's shared roots (two-tier FS). Admins get () =
+    # no confinement. This closes the raw /api/fs/* + /api/files* surface that
+    # would otherwise expose all of /opt/data.
+    from hermes_cli.dashboard_auth.rbac_map import fs_roots
+    roots = fs_roots()
+    if roots:
+        allowed = False
+        for r in roots:
+            rp = Path(r)
+            if resolved == rp or rp in resolved.parents:
+                allowed = True
+                break
+        if not allowed:
+            raise HTTPException(status_code=403, detail="Path outside your allowed space")
+    return resolved
 
 
 def _fs_mime_type(path: Path) -> str:
@@ -1089,6 +1108,15 @@ def _fs_find_git_root(start: Path) -> str | None:
 
 
 def _fs_default_cwd() -> str:
+    # RBAC: a pinned user's file browser opens in their own profile home.
+    from hermes_cli.dashboard_auth.rbac_map import get_lock
+    locked = get_lock()
+    if locked:
+        try:
+            from hermes_cli import profiles as profiles_mod
+            return str(profiles_mod.get_profile_dir(locked))
+        except Exception:
+            pass
     cfg_terminal = load_config().get("terminal") or {}
     raw = str(cfg_terminal.get("cwd") or os.environ.get("TERMINAL_CWD") or "").strip()
     if raw and raw not in {".", "auto", "cwd"}:
@@ -1225,6 +1253,22 @@ def _default_hermes_root_is_opt_data() -> bool:
 
 
 def _managed_files_policy(request: Request, *, create_root: bool = True) -> ManagedFilesPolicy:
+    # RBAC: a pinned (non-admin) user's managed-files browser is confined to
+    # their OWN profile home (the container /opt/data layout otherwise locks to
+    # the whole /opt/data, exposing every profile). Shared role dirs are
+    # additionally permitted by the containment check in _resolve_managed_path.
+    try:
+        from hermes_cli.dashboard_auth.rbac_map import get_lock
+        locked = get_lock()
+        if locked:
+            from hermes_cli import profiles as profiles_mod
+            home = _canonical_path(profiles_mod.get_profile_dir(locked))
+            return ManagedFilesPolicy(default_path=home, locked_root=home, can_change_path=False)
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
     raw_forced_root = os.environ.get(_MANAGED_FILES_ROOT_ENV, "").strip()
     if raw_forced_root:
         root = _ensure_managed_root(raw_forced_root) if create_root else _canonical_path(Path(raw_forced_root))
@@ -1276,7 +1320,12 @@ def _resolve_managed_path(
         resolved = _canonical_path(candidate, require_exists=not for_write)
 
     if root is not None and not _path_is_under(root, resolved):
-        raise HTTPException(status_code=403, detail="Path outside managed files root")
+        # Pinned users may also reach their role's SHARED roots (two-tier FS),
+        # not only their private profile root.
+        from hermes_cli.dashboard_auth.rbac_map import fs_roots
+        shared_ok = any(_path_is_under(Path(r), resolved) for r in fs_roots())
+        if not shared_ok:
+            raise HTTPException(status_code=403, detail="Path outside your allowed space")
 
     return policy, resolved, str(resolved)
 
@@ -6491,6 +6540,11 @@ def _open_session_db_for_profile(profile: Optional[str]):
     (transcripts, detail) without spawning that profile's backend.
     """
     from hermes_state import SessionDB
+    from hermes_cli.dashboard_auth.rbac_map import enforce
+    # RBAC: a pinned (non-admin) user always reads ONLY their own profile's
+    # sessions — profile=None would otherwise fall through to the dashboard's
+    # default-profile state.db (another tenant's sessions).
+    profile = enforce(profile)
     if not profile:
         return SessionDB()
     _name, home = _cron_profile_home(profile)
@@ -6727,7 +6781,10 @@ def _cron_profile_dicts() -> List[Dict[str, Any]]:
 def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
     """Resolve a profile query value to (profile_name, HERMES_HOME)."""
     from hermes_cli import profiles as profiles_mod
+    from hermes_cli.dashboard_auth.rbac_map import enforce
 
+    # RBAC: pinned users are locked to their own profile (overrides ?profile=).
+    profile = enforce(profile)
     raw = (profile or "default").strip() or "default"
     try:
         canon = profiles_mod.normalize_profile_name(raw)
@@ -8687,6 +8744,10 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
 def _resolve_profile_dir(name: str) -> Path:
     """Validate ``name`` and resolve to its directory or raise an HTTPException."""
     from hermes_cli import profiles as profiles_mod
+    from hermes_cli.dashboard_auth.rbac_map import enforce
+    # RBAC: a pinned (non-admin) user is locked to their own profile, so an
+    # explicit ?profile=other is overridden with the locked profile.
+    name = enforce(name) or name
     try:
         profiles_mod.validate_profile_name(name)
     except ValueError as e:
@@ -8816,14 +8877,27 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
     return disabled_count
 
 
+def _rbac_filter_profiles(profiles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """When a per-user profile lock is active (non-admin), expose ONLY that
+    user's own profile so the dashboard's switcher can't see or list other
+    users' profiles. Admins (no lock) get the full machine-level list."""
+    from hermes_cli.dashboard_auth.rbac_map import get_lock
+
+    locked = get_lock()
+    if not locked:
+        return profiles
+    return [p for p in profiles if p.get("name") == locked]
+
+
 @app.get("/api/profiles")
 async def list_profiles_endpoint():
     from hermes_cli import profiles as profiles_mod
     try:
-        return {"profiles": [_profile_to_dict(p) for p in profiles_mod.list_profiles()]}
+        items = [_profile_to_dict(p) for p in profiles_mod.list_profiles()]
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        return {"profiles": _fallback_profile_dicts(profiles_mod)}
+        items = _fallback_profile_dicts(profiles_mod)
+    return {"profiles": _rbac_filter_profiles(items)}
 
 
 @app.post("/api/profiles")
@@ -10418,6 +10492,13 @@ async def pty_ws(ws: WebSocket) -> None:
     # --- spawn PTY ------------------------------------------------------
     resume = ws.query_params.get("resume") or None
     profile = ws.query_params.get("profile") or None
+    # RBAC: honor a request-scoped profile lock if one is active. NOTE: the
+    # chat WS authenticates via a minted ticket rather than the HTTP auth
+    # middleware, so for gated deployments the per-user pin must also be set
+    # during ticket validation (tracked as a remaining item) for full
+    # enforcement on the /chat tab.
+    from hermes_cli.dashboard_auth.rbac_map import enforce as _rbac_enforce
+    profile = _rbac_enforce(profile)
     channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
 

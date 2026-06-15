@@ -169,6 +169,35 @@ def _safe_next_target(request: Request) -> str:
     return quote(target, safe="")
 
 
+def _apply_rbac_lock(session):
+    """Pin a verified session to its per-user profile for this request.
+
+    Admins (HERMES_ADMIN_EMAILS) are left unlocked so they keep the
+    machine-level profile switcher. Everyone else is locked to their own
+    profile id derived from the verified email, so any ?profile=other is
+    overridden downstream by the profile-resolution chokepoints. Returns a
+    contextvar token for :func:`_release_rbac_lock`."""
+    from hermes_cli.dashboard_auth import rbac_map
+
+    email = getattr(session, "email", "") or ""
+    if not email or rbac_map.is_admin(email):
+        return (rbac_map.set_lock(None), rbac_map.set_shared_roots(()))
+    # First login provisions the user's profile (private FS + role shared FS).
+    rbac_map.ensure_user_profile(email)
+    role = rbac_map.role_for_email(email)
+    lock_tok = rbac_map.set_lock(rbac_map.profile_for_email(email))
+    shared_tok = rbac_map.set_shared_roots(rbac_map.shared_dirs_for_role(role))
+    return (lock_tok, shared_tok)
+
+
+def _release_rbac_lock(tokens) -> None:
+    from hermes_cli.dashboard_auth import rbac_map
+
+    lock_tok, shared_tok = tokens
+    rbac_map.reset_lock(lock_tok)
+    rbac_map.reset_shared_roots(shared_tok)
+
+
 async def gated_auth_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
@@ -261,7 +290,11 @@ async def gated_auth_middleware(
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
             request.state.session = new_session
-            response = await call_next(request)
+            _tok = _apply_rbac_lock(new_session)
+            try:
+                response = await call_next(request)
+            finally:
+                _release_rbac_lock(_tok)
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
             # back is mandatory: a stale RT cookie would replay a rotated
@@ -307,7 +340,11 @@ async def gated_auth_middleware(
         return response
 
     request.state.session = session
-    return await call_next(request)
+    _tok = _apply_rbac_lock(session)
+    try:
+        return await call_next(request)
+    finally:
+        _release_rbac_lock(_tok)
 
 
 def _expires_in_seconds(session) -> int:

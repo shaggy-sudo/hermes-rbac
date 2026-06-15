@@ -1,0 +1,8 @@
+name: google
+version: 1.0.0
+description: "Dashboard auth provider — Google OAuth 2.0 (authorization-code + PKCE, confidential web client). Auto-activates when GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are set. Optional GOOGLE_ALLOWED_DOMAIN / GOOGLE_ALLOWED_EMAILS restrict access to your team. Sessions carry the verified Google email, which the RBAC layer maps to a per-user profile (private FS) + role (shared FS)."
+author: hermes-rbac
+kind: backend
+requires_env:
+  - GOOGLE_CLIENT_ID
+  - GOOGLE_CLIENT_SECRET
