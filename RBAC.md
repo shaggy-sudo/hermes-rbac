@@ -70,6 +70,7 @@ email propagation + channel namespacing).
 - **[rbac/AUTH.md](rbac/AUTH.md)** — Google OAuth gate setup (Cloud Console, redirect URI)
 - **[rbac/SYNC.md](rbac/SYNC.md)** — keeping this fork in sync with upstream Hermes
 - **[rbac/hooks/README.md](rbac/hooks/README.md)** — shared role-memory hook
+- **[rbac/CHANGELOG.md](rbac/CHANGELOG.md)** — RBAC layer change history (hardening pass)
 
 ## Quick start (macOS / OrbStack)
 ```bash

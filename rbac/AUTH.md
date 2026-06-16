@@ -49,18 +49,28 @@ GOOGLE_CLIENT_SECRET=...
 GOOGLE_ALLOWED_DOMAIN=yourco.com
 HERMES_ADMIN_EMAILS=you@yourco.com
 HERMES_DEFAULT_ROLE=viewer
+ROUTER_SECRET=$(openssl rand -hex 32)
+HERMES_HOST_DATA=/abs/path/to/~/.hermes
+HERMES_DASHBOARD_PUBLIC_URL=https://your-public-url
 ```
 
-Then in `docker-compose.mac.yml`, switch the dashboard `command` from the
-`--insecure` line (MODE 1) to the gated line (MODE 2), and recreate:
+**Production (router):** bring up the router; it serves the gate and spawns a
+per-user container on first login.
 
 ```bash
+docker network create hermes-rbac-net   # once
 HERMES_UID=$(id -u) HERMES_GID=$(id -g) \
-  docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d dashboard
+  docker compose -f docker-compose.yml -f docker-compose.router.yml up -d router
 ```
 
-Visit the dashboard → it redirects to `/login` → **Log in with Google** →
-company account → you land scoped to your own profile.
+Register `<public-url>/auth/callback` as an Authorized redirect URI, open the
+public URL → branded `/login` → **Continue with Google** → company account →
+you land in your own container scoped to your profile.
+
+**Legacy (standalone dashboard):** the machine-level admin dashboard in
+`docker-compose.mac.yml` can run gated instead — switch its `command` from the
+`--insecure` line to the gated line and recreate the `dashboard` service. This
+is superseded by the router for end users.
 
 ## Roles from Workspace (future)
 
@@ -80,9 +90,33 @@ identity persistence writes the full record.
 Needs your Google OAuth client + a browser: the actual Google consent + token
 exchange, and the live per-user redirect end-to-end.
 
-## Known remaining item
+## Production front door: the router
 
-The `/chat` tab WebSocket authenticates via a minted ticket, not the HTTP auth
-middleware, so the request-scoped profile lock isn't set on that path yet. For
-full enforcement on the chat terminal, set the lock during WS ticket validation
-(the REST API, skills, config, and cron endpoints are already enforced).
+In production the **router** (`rbac/router/router.py`), not the standalone
+dashboard, serves the gate. It reuses `GoogleDashboardAuthProvider`, then
+reverse-proxies to the user's own container. Operational notes:
+
+- **`ROUTER_SECRET`** signs the session cookie and **must** be ≥32 chars — the
+  router refuses to start otherwise (`openssl rand -hex 32`). A weak/default
+  secret would let anyone forge a cookie for any email. `docker-compose.router.yml`
+  uses a `:?` guard so the value is required.
+- **Cookies** (session + PKCE) are `SameSite=Lax`, `HttpOnly`, and `Secure` over
+  HTTPS. Lax (not Strict) is required: the post-OAuth landing on `/` is the tail
+  of a cross-site redirect from Google, and Strict would withhold the cookie
+  there → an endless `/login` loop.
+- **Branded UX**: `/login` renders a branded "Continue with Google" page;
+  denied-domain / failed sign-in render friendly HTML (never raw JSON or
+  exception text).
+- **Stable SPA token**: the router pins each container's `--insecure` session
+  token to `hmac(ROUTER_SECRET, email)` so container respawns/restarts don't
+  invalidate an already-open browser tab.
+
+## WebSocket enforcement (closed)
+
+The `/chat` PTY and the gateway/event WebSockets authenticate via a minted
+ticket rather than the HTTP auth middleware. The ticket now carries the verified
+email, and the handlers re-apply the per-user lock for the socket's lifetime
+(`_ws_rbac_lock`), so a pinned user can no longer pass `?profile=<other>` on
+`/api/pty` or drive another tenant's gateway; pub/sub channels are namespaced
+per tenant. (REST API, skills, config, env, sessions, memory, logs, and cron
+were already enforced.)

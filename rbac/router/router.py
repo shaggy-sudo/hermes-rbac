@@ -18,11 +18,28 @@ Env:
   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET   OAuth web client
   GOOGLE_ALLOWED_DOMAIN / GOOGLE_ALLOWED_EMAILS   team restriction (optional)
   HERMES_ADMIN_EMAILS                       admins (get full-data container)
-  ROUTER_PUBLIC_URL                         e.g. https://xxx.ngrok-free.app
-  ROUTER_SECRET                             cookie-signing secret
+  ROUTER_PUBLIC_URL                         public base URL, e.g. https://host/
+  ROUTER_SECRET                             cookie-signing secret — REQUIRED,
+                                            >=32 chars; the router refuses to
+                                            start with a blank/default/short
+                                            value (openssl rand -hex 32). Also
+                                            derives the stable per-user
+                                            dashboard session token.
   HERMES_HOST_DATA                          HOST path of ~/.hermes (for -v src)
   HERMES_IMAGE                              per-user container image
   HERMES_NET                                docker network shared with users
+  OPENROUTER_API_KEY / HERMES_DEFAULT_MODEL forwarded into user containers
+
+Per-user containers additionally receive (set ONLY by this router, so they
+cannot be forged by users):
+  HERMES_RBAC_USER_EMAIL / HERMES_RBAC_USER_ROLE / HERMES_RBAC_IS_ADMIN
+                                            verified identity → /api/auth/me
+  HERMES_RBAC_ADMIN_EMAIL                   admin vouch (admins only) → /rbac
+  HERMES_DASHBOARD_SESSION_TOKEN            stable --insecure SPA token
+                                            (survives respawns)
+
+Reads <HERMES_HOST_DATA>/rbac/shared-access.json (role -> "rw"|"ro") to decide
+whether a role's /shared mount is read-only.
 """
 
 from __future__ import annotations
